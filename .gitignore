@@ -1,2 +1,4 @@
 data/
 papers/
+.vscode
+.env
