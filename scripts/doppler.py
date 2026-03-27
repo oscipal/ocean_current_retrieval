@@ -7,6 +7,8 @@ Two estimators are provided:
 """
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d, gaussian_filter
+from scipy.interpolate import RectBivariateSpline
 from .io import read_slc, parse_slc_par
 
 
@@ -17,6 +19,7 @@ def fft_doppler(
     win_rg: int,
     stride_az: int,
     stride_rg: int,
+    smooth_sigma: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Estimate Doppler centroids using the FFT weighted-centroid method.
@@ -33,6 +36,10 @@ def fft_doppler(
         Window size in azimuth and range pixels.
     stride_az, stride_rg : int
         Step size between windows in azimuth and range.
+    smooth_sigma : float or None
+        Standard deviation (in frequency bins) for Gaussian smoothing applied
+        to the power spectrum before centroid estimation. If None (default),
+        no smoothing is applied. Stored spectra reflect the smoothed values.
 
     Returns
     -------
@@ -61,6 +68,9 @@ def fft_doppler(
             patch = slc[az_0:az_0 + win_az, rg_0:rg_0 + win_rg]
             S = np.fft.fftshift(np.fft.fft(patch, axis=0), axes=0)
             P = np.sum(np.abs(S) ** 2, axis=1)
+
+            if smooth_sigma is not None:
+                P = gaussian_filter1d(P, sigma=smooth_sigma)
 
             f_dc = np.sum(freqs * P) / np.sum(P)
             spectrum[j, i] = P
@@ -172,3 +182,59 @@ def dc_precision(snr: float, prf: float, win_az: int, win_rg: int) -> float:
     """
     delta_f = prf / win_az
     return delta_f / np.sqrt(2 * snr * win_rg)
+
+
+def smooth_dc_map(
+    dc_tiled: np.ndarray,
+    stride_az: int,
+    stride_rg: int,
+    sigma_az: float = 1.5,
+    sigma_rg: float = 1.5,
+) -> np.ndarray:
+    """
+    Smooth a tiled DC map by working at window resolution then interpolating.
+
+    The tiled DC image contains repeated block values (one per estimation
+    window). This function:
+      1. Extracts the window-resolution grid  (n_az, n_rg)
+      2. Applies a 2-D Gaussian filter in window units
+      3. Bilinearly interpolates back to the original pixel resolution
+
+    This avoids block-edge artefacts and produces a smooth continuous surface.
+
+    Parameters
+    ----------
+    dc_tiled  : np.ndarray, shape (n_az*stride_az, n_rg*stride_rg)
+        Tiled DC image as returned by fft_doppler / cde_doppler.
+    stride_az, stride_rg : int
+        Strides used during estimation (pixels per window step).
+    sigma_az, sigma_rg : float
+        Gaussian smoothing width in *window* units (default 1.5 windows).
+        Increase to smooth more aggressively.
+
+    Returns
+    -------
+    np.ndarray, shape == dc_tiled.shape
+        Smoothed DC map at full pixel resolution.
+    """
+    # number of windows
+    n_az = dc_tiled.shape[0] // stride_az
+    n_rg = dc_tiled.shape[1] // stride_rg
+
+    # extract one value per window (top-left corner of each tile block)
+    dc_windows = dc_tiled[::stride_az, ::stride_rg][:n_az, :n_rg]
+
+    # smooth at window resolution
+    dc_smooth = gaussian_filter(dc_windows, sigma=(sigma_az, sigma_rg))
+
+    # window-centre coordinates in pixel space
+    az_centres = (np.arange(n_az) + 0.5) * stride_az
+    rg_centres = (np.arange(n_rg) + 0.5) * stride_rg
+
+    # bilinear interpolation onto full pixel grid
+    spline = RectBivariateSpline(az_centres, rg_centres, dc_smooth, kx=1, ky=1)
+
+    az_full = np.arange(dc_tiled.shape[0])
+    rg_full = np.arange(dc_tiled.shape[1])
+
+    return spline(az_full, rg_full)

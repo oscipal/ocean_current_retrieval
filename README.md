@@ -54,6 +54,7 @@ data/
 | BIOMASS L1a SLC | [ESA MAAP Explorer](https://explorer.maap.eo.esa.int/?q=BiomassLevel1a) | — |
 | Ocean currents (NRT) | [MULTIOBS_GLO_PHY_MYNRT_015_003](https://data.marine.copernicus.eu/product/MULTIOBS_GLO_PHY_MYNRT_015_003/description) | 0.125° |
 | Ocean currents (forecast) | [GLOBAL_ANALYSISFORECAST_PHY_001_024](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_PHY_001_024/description) | 0.083° |
+| Ionosphere TEC | [https://cddis.nasa.gov/archive/gnss/products/ionex/2026/] | - |
 
 ---
 
