@@ -4,6 +4,10 @@ Retrieval of ocean surface current velocities from spaceborne SAR imagery using 
 
 Currently targets ESA **BIOMASS** (P-band, ~435 MHz) and **Sentinel-1** (C-band) SAR data.
 
+For Sentinel-1, this repository currently contains two separate code paths:
+- `scripts/s1_rvl.py` and `scripts/s1_ocn.py` work from Level-1 SLC data and implement the retrieval side of the project.
+- `scripts/s1_ocn_product.py` is a standalone reader for Level-2 OCN SAFE products. It opens the delivered NetCDF files and returns the `rvl`, `owi`, and `osw` groups as `xarray` datasets. It is useful for inspection and comparison, but is not currently wired into the main analysis workflow elsewhere in this repo.
+
 ---
 
 ## Method Overview
@@ -33,11 +37,13 @@ notebooks/
   s1_desert.ipynb         # Sentinel-1 burst-level DC estimation (desert calibration)
 
 scripts/
-  io.py                   # SLC and annotation file I/O
-  doppler.py              # FFT and CDE Doppler centroid estimators, SNR utilities
-  geometry.py             # Geometry DC estimation from annotation polynomials
+  io.py                   # Generic SLC file I/O
+  s1_io.py                # Sentinel-1 SAFE discovery and annotation parsing
+  s1_rvl.py               # Sentinel-1 RVL retrieval from SLC bursts
+  s1_ocn.py               # Sentinel-1 OCN-style products derived from SLC inputs
   ocean_currents.py       # Copernicus Marine NetCDF loading and GeoTIFF export
   plotting.py             # DC map and spectrum visualisation
+  s1_ocn_product.py       # Direct Sentinel-1 Level-2 OCN SAFE reader
 
 data/
   Biomass_data/           # BIOMASS SLC scenes (.slc, .slc.par, annotation XML)
@@ -72,28 +78,4 @@ Create a conda environment with all dependencies:
 ```bash
 conda create --name ocr --file requirements.txt
 conda activate ocr
-```
-
----
-
-## Usage
-
-The `scripts/` package can be imported directly in notebooks or scripts:
-
-```python
-from scripts.io import read_slc, parse_slc_par
-from scripts.doppler import fft_doppler, cde_doppler, spectral_snr, dc_precision
-from scripts.geometry import estimate_geom_doppler
-
-# Estimate Doppler centroids
-dc_img, freqs, spectrum = fft_doppler(SLC_PATH, SLC_PAR_PATH, win_az=512, win_rg=100, stride_az=256, stride_rg=100)
-
-# Subtract geometry contribution
-geom_dc = estimate_geom_doppler(ANNOT_XML, doppler_img=dc_img)
-dca = dc_img - geom_dc
-
-# Check SNR
-snr, noise = spectral_snr(spectrum[0, 0])
-sigma_dc = dc_precision(snr, prf=1/dt_a, win_az=512, win_rg=100)
-print(f"DC estimate std: {sigma_dc:.4f} Hz")
 ```
