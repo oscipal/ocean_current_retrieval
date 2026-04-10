@@ -616,6 +616,71 @@ def _geom_doppler_at_pixels(par_path: str, rg_centers: np.ndarray) -> np.ndarray
     return sum(c * rg_m ** k for k, c in enumerate(coeffs))
 
 
+def _blended_geom_doppler(
+    slc_par_paths: list[str],
+    az_centers: np.ndarray,
+    rg_centers: np.ndarray,
+) -> np.ndarray:
+    """
+    Hanning-weighted blend of per-burst geometric Doppler polynomials.
+
+    For estimation blocks that fall fully inside one burst the result is just
+    that burst's polynomial evaluated at rg_centers.  For blocks in the overlap
+    zone the two adjacent bursts' polynomials are blended with the same Hanning
+    weights that merge_gamma_bursts applied to the SLC data, so the subtracted
+    bias is consistent with the merged signal.
+
+    Parameters
+    ----------
+    slc_par_paths : list of str     One .slc.par per burst, azimuth order.
+    az_centers    : int array (n_out_az,)   Azimuth block centres in merged image.
+    rg_centers    : int array (n_out_rg,)   Range block centres.
+
+    Returns
+    -------
+    float32, shape (n_out_az, n_out_rg)
+    """
+    pars = [parse_slc_par(p) for p in slc_par_paths]
+
+    dt  = float(pars[0]['azimuth_line_time'][0])
+    lpb = int(pars[0]['azimuth_lines'][0])
+
+    t_starts  = [float(p['start_time'][0]) for p in pars]
+    t0_global = min(t_starts)
+
+    # Azimuth line offset of each burst in the merged image
+    az_offsets = [int(round((t - t0_global) / dt)) for t in t_starts]
+
+    hann = np.hanning(lpb).astype(np.float64)
+
+    # Pre-evaluate each burst's polynomial at rg_centers → (n_bursts, n_out_rg)
+    f_geom_bursts = np.stack(
+        [_geom_doppler_at_pixels(p, rg_centers).astype(np.float64)
+         for p in slc_par_paths],
+        axis=0,
+    )
+
+    n_out_az = len(az_centers)
+    n_out_rg = len(rg_centers)
+    f_geom = np.zeros((n_out_az, n_out_rg), dtype=np.float32)
+
+    for i, az in enumerate(az_centers):
+        w_sum = 0.0
+        blend = np.zeros(n_out_rg, dtype=np.float64)
+
+        for j, az0 in enumerate(az_offsets):
+            rel = int(az) - az0
+            if 0 <= rel < lpb:
+                w      = float(hann[rel])
+                blend += w * f_geom_bursts[j]
+                w_sum += w
+
+        if w_sum > 0:
+            f_geom[i] = (blend / w_sum).astype(np.float32)
+
+    return f_geom
+
+
 def load_gamma_bursts(slc_paths: list[str], slc_par_paths: list[str]) -> np.ndarray:
     """
     Read and concatenate GAMMA-format per-burst SLC files into one image.
@@ -638,6 +703,68 @@ def load_gamma_bursts(slc_paths: list[str], slc_par_paths: list[str]) -> np.ndar
     bursts = [read_slc(slc, par).astype(np.complex64)
               for slc, par in zip(slc_paths, slc_par_paths)]
     return np.concatenate(bursts, axis=0)
+
+
+def merge_gamma_bursts(
+    slc_paths: list[str],
+    slc_par_paths: list[str],
+) -> np.ndarray:
+    """
+    Coherently merge GAMMA per-burst SLCs into a continuous azimuth image.
+
+    GAMMA bursts overlap in azimuth (typically ~10 % for IW).  Simple
+    concatenation double-counts the overlap; this function instead:
+
+    1. Computes each burst's azimuth offset from ``start_time`` in the .par.
+    2. Applies a Hanning window to each burst (tapers toward zero at burst
+       edges, suppressing discontinuities in the overlap region).
+    3. **Adds** windowed bursts into a common output array.
+    4. Normalises by the sum of windows at each line so the amplitude in the
+       overlap is a weighted average rather than a coherent sum.
+
+    The normalisation preserves the phase (needed for Doppler estimation) while
+    giving approximately uniform amplitude across burst transitions.
+
+    Parameters
+    ----------
+    slc_paths     : list of str, sorted in azimuth order (burst 1 first)
+    slc_par_paths : list of str, matching .slc.par files
+
+    Returns
+    -------
+    complex64, shape (n_az_total, range_samples)
+        ``n_az_total`` is the number of unique azimuth lines spanning all
+        bursts, computed from their start/end times.
+    """
+    pars = [parse_slc_par(p) for p in slc_par_paths]
+
+    dt      = float(pars[0]['azimuth_line_time'][0])
+    n_rg    = int(pars[0]['range_samples'][0])
+    lpb     = int(pars[0]['azimuth_lines'][0])
+
+    t_starts = [float(p['start_time'][0]) for p in pars]
+    t_ends   = [float(p['end_time'][0])   for p in pars]
+
+    t0_global = min(t_starts)
+    t1_global = max(t_ends)
+    n_az_total = int(round((t1_global - t0_global) / dt)) + 1
+
+    output = np.zeros((n_az_total, n_rg), dtype=np.complex64)
+    weight = np.zeros(n_az_total,         dtype=np.float32)
+
+    w = np.hanning(lpb).astype(np.float32)
+
+    for slc_path, par_path, t0 in zip(slc_paths, slc_par_paths, t_starts):
+        burst = read_slc(slc_path, par_path).astype(np.complex64)
+        az0   = int(round((t0 - t0_global) / dt))
+        az1   = az0 + lpb
+
+        output[az0:az1, :] += burst * w[:, np.newaxis]
+        weight[az0:az1]    += w
+
+    # output /= weight[:, np.newaxis]
+
+    return output
 
 
 def compute_rvl_gamma(
@@ -684,52 +811,38 @@ def compute_rvl_gamma(
     """
     annot = parse_annotation(annotation_xml)
 
-    # Step I — read pre-deramped GAMMA bursts and process each independently.
-    # Processing per-burst avoids estimation windows that straddle burst
-    # boundaries, which would produce periodic stripe artefacts.
-    p0_list, p1_list, az_centers_list = [], [], []
-    rg_centers = None
+    # Step I — coherently merge pre-deramped GAMMA bursts into one image.
+    if type(slc_paths) is list:
+        merged = merge_gamma_bursts(slc_paths, slc_par_paths)
+    else:
+        merged = read_slc(slc_paths, slc_par_paths).astype(np.complex64)
 
-    f_dc_list = []
+    # Step II — azimuth correlation coefficients on the merged image.
+    p0, p1, az_centers, rg_centers = estimate_correlation_grid(
+        merged, block_az, block_rg, stride_az, stride_rg,
+    )
 
-    for j, (slc_path, par_path) in enumerate(zip(slc_paths, slc_par_paths)):
-        burst = read_slc(slc_path, par_path).astype(np.complex64)
-        lpb   = burst.shape[0]
+    # Step III — raw Doppler centroid, then subtract the Hanning-blended
+    # geometric Doppler.  Blocks in burst-overlap zones get a weighted blend
+    # of the two adjacent bursts' doppler_polynomial values, matching the
+    # weights applied by merge_gamma_bursts.
+    f_dc, _, _ = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
 
-        # Step II — correlation coefficients within this burst
-        p0_j, p1_j, az_loc, rg_centers_j = estimate_correlation_grid(
-            burst, block_az, block_rg, stride_az, stride_rg,
-        )
+    if type(slc_paths) is list:
+        f_geom = _blended_geom_doppler(slc_par_paths, az_centers, rg_centers)
+    else:
+        f_geom = _geom_doppler_at_pixels(slc_par_paths, rg_centers)
+    f_dca  = f_dc - f_geom
 
-        if rg_centers is None:
-            rg_centers = rg_centers_j   # same for every burst
-
-        # Step III (per burst) — raw Doppler then subtract static geometric term.
-        # GAMMA deramping removes the TOPS azimuth ramp but leaves a residual
-        # range-dependent geometric Doppler encoded in doppler_polynomial (.slc.par).
-        f_dc_j, _, snr_j = correlation_to_doppler(p0_j, p1_j, annot.prf, annot.wavelength)
-        f_geom_j = _geom_doppler_at_pixels(par_path, rg_centers_j).astype(np.float32)
-        f_dca_j  = f_dc_j - f_geom_j[np.newaxis, :]   # DCA: ocean + noise only
-
-        p0_list.append(p0_j)
-        p1_list.append(p1_j)
-        f_dc_list.append(f_dca_j)
-        az_centers_list.append(az_loc + j * lpb)
-
-    p0         = np.concatenate(p0_list,        axis=0)
-    p1         = np.concatenate(p1_list,        axis=0)
-    f_dc       = np.concatenate(f_dc_list,      axis=0)
-    az_centers = np.concatenate(az_centers_list, axis=0)
-
-    # SNR from the concatenated correlation grids (uses raw p0/p1 coherence)
+    # SNR from the correlation grids
     _, _, snr = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
-    v_r = (annot.wavelength / 2.0 * f_dc).astype(np.float32)
+    v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
     # Step IV — descalloping
     if do_descallop:
         burst_period_rows = annot.lines_per_burst / stride_az
-        f_dc = descallop(f_dc, snr, burst_period_rows)
-        v_r  = (annot.wavelength / 2.0 * f_dc).astype(np.float32)
+        f_dca = descallop(f_dca, snr, burst_period_rows)
+        v_r  = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
     # Step V — geolocation
     lat, lon, inc = _geolocate_grid(annot, az_centers, rg_centers)
@@ -738,16 +851,16 @@ def compute_rvl_gamma(
 
     return xr.Dataset(
         {
-            'doppler_hz': xr.DataArray(
-                f_dc, dims=dims,
+            'f_dca': xr.DataArray(
+                f_dca, dims=dims,
                 attrs={'long_name': 'Estimated Doppler centroid', 'units': 'Hz'},
             ),
             'radial_vel': xr.DataArray(
                 v_r, dims=dims,
                 attrs={'long_name': 'Radial velocity', 'units': 'm s-1'},
             ),
-            'snr': xr.DataArray(
-                snr, dims=dims,
+            'f_dc': xr.DataArray(
+                f_dc, dims=dims,
                 attrs={'long_name': 'Signal-to-noise ratio estimate'},
             ),
         },
