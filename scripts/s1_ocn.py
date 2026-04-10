@@ -7,14 +7,16 @@ This module is intentionally narrow:
 - it uses only the product variables that are present in that file
 - it works on one swath at a time, defaulting to the first swath
 
-The retrieval implemented here is the strongest "current-only" estimate that
-can be formed from the OCN product alone:
+The retrieval implemented here uses only information already present in the
+OCN file:
 
-    radial_current = rvlRadVel - radial(Stokes drift)
+    currentRadVel = rvlRadVel - radial(Stokes drift) - radial(wind drift)
 
-where the Stokes drift is projected from ``rvlUssX`` and ``rvlUssY`` using the
-platform heading.  No external wind or wave model is used beyond what is
-already embedded in the OCN product.
+Stokes drift is projected from ``rvlUssX`` / ``rvlUssY`` using the platform
+heading.  Wind drift is estimated as ``alpha * owiWindSpeed`` projected onto
+the look direction, where ``alpha`` (default 0.016) is the empirical wind
+drift factor.  ``owiWindDirection`` follows the oceanographic convention
+(direction the wind is blowing *toward*, clockwise from north).
 
 This remains a radial current estimate, not a full 2-D current vector.
 """
@@ -25,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from scipy.interpolate import griddata
 
 
 def _find_combined_ocn_file(
@@ -228,47 +231,138 @@ def stokes_radial_velocity(rvl: xr.Dataset, antenna_side: str = "right") -> xr.D
     return radial
 
 
-def retrieve_radial_current(
-    safe_dir: str,
-    polarisation: str | None = None,
-    swath_index: int = 0,
+def _regrid_owi_to_rvl(
+    owi: xr.Dataset,
+    rvl: xr.Dataset,
+    variables: list[str],
+) -> dict[str, np.ndarray]:
+    """
+    Interpolate OWI variables onto the RVL grid.
+
+    OWI and RVL use independent grids with different resolutions.  A scattered
+    linear interpolation (scipy ``griddata``) is used because both grids are in
+    swath geometry and their lat/lon arrays are 2-D.
+    """
+    owi_lon = owi["owiLon"].values.ravel()
+    owi_lat = owi["owiLat"].values.ravel()
+    rvl_lon = rvl["rvlLon"].values
+    rvl_lat = rvl["rvlLat"].values
+
+    owi_points = np.column_stack([owi_lon, owi_lat])
+    rvl_points = np.column_stack([rvl_lon.ravel(), rvl_lat.ravel()])
+
+    result: dict[str, np.ndarray] = {}
+    for var in variables:
+        vals = owi[var].values.ravel().astype(float)
+        valid = np.isfinite(vals)
+        interpolated = griddata(
+            owi_points[valid], vals[valid], rvl_points, method="linear"
+        )
+        result[var] = interpolated.reshape(rvl_lon.shape)
+    return result
+
+
+def wind_drift_radial_velocity(
+    rvl: xr.Dataset,
+    owi: xr.Dataset,
+    alpha: float = 0.016,
     antenna_side: str = "right",
+) -> xr.DataArray:
+    """
+    Project wind-induced surface drift onto the radar look direction.
+
+    The wind drift velocity is modelled as ``alpha * U_10`` directed along the
+    wind.  ``owiWindDirection`` is expected in oceanographic convention
+    (direction the wind blows *toward*, clockwise from north).
+
+    The radial component is:
+
+        wind_drift_radial = alpha * U_10 * cos(theta_wind - theta_look)
+
+    OWI variables are interpolated onto the RVL grid before projection.
+
+    Parameters
+    ----------
+    alpha : float
+        Empirical wind drift factor (dimensionless).  Typical range 0.013–0.017;
+        default 0.016.
+    """
+    for name in ("owiWindSpeed", "owiWindDirection", "owiLon", "owiLat"):
+        if name not in owi:
+            raise KeyError(f"{name} is required for wind drift correction")
+    for name in ("rvlLon", "rvlLat"):
+        if name not in rvl:
+            raise KeyError(f"{name} is required for wind drift correction")
+
+    regridded = _regrid_owi_to_rvl(owi, rvl, ["owiWindSpeed", "owiWindDirection"])
+
+    look_deg = look_azimuth(rvl, antenna_side=antenna_side).values
+    wind_dir_rad = np.deg2rad(regridded["owiWindDirection"])
+    look_rad = np.deg2rad(look_deg)
+
+    drift_values = alpha * regridded["owiWindSpeed"] * np.cos(wind_dir_rad - look_rad)
+
+    # Recover a reference DataArray for dims/coords from rvlRadVel
+    ref = rvl["rvlRadVel"]
+    da = xr.DataArray(
+        drift_values,
+        dims=ref.dims,
+        coords=ref.coords,
+        attrs={
+            "units": "m s-1",
+            "long_name": "Wind-induced surface drift radial velocity",
+            "wind_drift_factor": alpha,
+            "wind_direction_convention": "oceanographic (toward), clockwise from north",
+        },
+    )
+    da.name = "windDriftRadial"
+    return da
+
+
+def _compute_radial_current(
+    rvl: xr.Dataset,
+    owi: xr.Dataset | None = None,
+    antenna_side: str = "right",
+    wind_drift_alpha: float = 0.016,
 ) -> xr.Dataset:
     """
-    Retrieve the radial velocity induced by ocean current from the OCN product.
+    Core computation: derive radial current from pre-loaded RVL (and optionally OWI) datasets.
 
-    The estimate uses only information already present in the OCN file:
+        currentRadVel = rvlRadVel - radial(Stokes drift) [- radial(wind drift)]
 
-        currentRadVel = rvlRadVel - rvlUssRadial
-
-    and is masked to cells where ``rvlMask == 0``.
+    masked to cells where ``rvlMask == 0``.  Wind drift correction is applied
+    when ``owi`` is provided.
     """
-    rvl = load_rvl(
-        safe_dir,
-        polarisation=polarisation,
-        swath_index=swath_index,
-    )
-
     keep = valid_rvl_mask(rvl)
     look = look_azimuth(rvl, antenna_side=antenna_side)
     stokes = stokes_radial_velocity(rvl, antenna_side=antenna_side)
 
-    current = (rvl["rvlRadVel"] - stokes).where(keep)
+    geophysical = rvl["rvlRadVel"] - stokes
+    if owi is not None:
+        wind_drift = wind_drift_radial_velocity(
+            rvl, owi, alpha=wind_drift_alpha, antenna_side=antenna_side
+        )
+        geophysical = geophysical - wind_drift
+    else:
+        wind_drift = None
+
+    current = geophysical.where(keep)
     current.name = "currentRadVel"
     current.attrs["units"] = "m s-1"
     current.attrs["long_name"] = "Radial velocity induced by ocean current"
 
-    result = xr.Dataset(
-        {
-            "currentRadVel": current,
-            "rvlRadVel": rvl["rvlRadVel"],
-            "rvlUssRadial": stokes,
-            "rvlValid": keep,
-            "rvlMask": rvl["rvlMask"],
-            "lookAzimuth": look,
-        },
-        attrs=dict(rvl.attrs),
-    )
+    data_vars: dict[str, xr.DataArray] = {
+        "currentRadVel": current,
+        "rvlRadVel": rvl["rvlRadVel"],
+        "rvlUssRadial": stokes,
+        "rvlValid": keep,
+        "rvlMask": rvl["rvlMask"],
+        "lookAzimuth": look,
+    }
+    if wind_drift is not None:
+        data_vars["windDriftRadial"] = wind_drift
+
+    result = xr.Dataset(data_vars, attrs=dict(rvl.attrs))
 
     for name in (
         "rvlLon",
@@ -287,9 +381,42 @@ def retrieve_radial_current(
         if name in rvl:
             result[name] = rvl[name]
 
-    result.attrs["retrieval"] = "currentRadVel = rvlRadVel - radial(rvlUssX, rvlUssY)"
+    retrieval = "currentRadVel = rvlRadVel - radial(rvlUssX, rvlUssY)"
+    if wind_drift is not None:
+        retrieval += f" - windDriftRadial (alpha={wind_drift_alpha})"
+    result.attrs["retrieval"] = retrieval
     result.attrs["antenna_side"] = antenna_side
     return result
+
+
+def retrieve_radial_current(
+    safe_dir: str,
+    polarisation: str | None = None,
+    swath_index: int = 0,
+    antenna_side: str = "right",
+    correct_wind_drift: bool = True,
+    wind_drift_alpha: float = 0.016,
+) -> xr.Dataset:
+    """
+    Retrieve the radial velocity induced by ocean current from the OCN product.
+
+    The estimate uses only information already present in the OCN file:
+
+        currentRadVel = rvlRadVel - radial(Stokes drift) [- radial(wind drift)]
+
+    and is masked to cells where ``rvlMask == 0``.
+
+    Parameters
+    ----------
+    correct_wind_drift : bool
+        If True (default), subtract the wind-induced surface drift estimated
+        from the OWI wind speed and direction.
+    wind_drift_alpha : float
+        Empirical wind drift factor (default 0.016).
+    """
+    rvl = load_rvl(safe_dir, polarisation=polarisation, swath_index=swath_index)
+    owi = load_owi(safe_dir, polarisation=polarisation, swath_index=swath_index) if correct_wind_drift else None
+    return _compute_radial_current(rvl, owi=owi, antenna_side=antenna_side, wind_drift_alpha=wind_drift_alpha)
 
 
 def process_ocn(
@@ -297,6 +424,8 @@ def process_ocn(
     polarisation: str | None = None,
     swath_index: int = 0,
     antenna_side: str = "right",
+    correct_wind_drift: bool = True,
+    wind_drift_alpha: float = 0.016,
 ) -> dict[str, xr.Dataset]:
     """
     Convenience wrapper returning the opened OCN subsets and radial-current
@@ -304,11 +433,11 @@ def process_ocn(
     """
     rvl = load_rvl(safe_dir, polarisation=polarisation, swath_index=swath_index)
     owi = load_owi(safe_dir, polarisation=polarisation, swath_index=swath_index)
-    current = retrieve_radial_current(
-        safe_dir,
-        polarisation=polarisation,
-        swath_index=swath_index,
+    current = _compute_radial_current(
+        rvl,
+        owi=owi if correct_wind_drift else None,
         antenna_side=antenna_side,
+        wind_drift_alpha=wind_drift_alpha,
     )
     return {
         "rvl": rvl,

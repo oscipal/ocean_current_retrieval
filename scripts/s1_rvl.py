@@ -68,19 +68,42 @@ def _fm_rate_at_burst(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     return sum(c * dt**k for k, c in enumerate(afr.poly))  # Hz/s
 
 
-def _steering_doppler_rate(annot: S1Annotation) -> float:
+def _orbital_speed(annot: S1Annotation, burst_idx: int) -> float:
+    """
+    Return the satellite orbital speed [m/s] at the burst centre time.
+
+    Interpolated from the ECEF velocity state vectors stored in the annotation.
+    The full 3-D speed |v| is used because k_psi depends on the physical
+    angular sweep rate of the antenna in inertial space, not the ground-track
+    speed.
+    """
+    burst_time = annot.bursts[burst_idx].azimuth_time
+    diffs = [abs((t - burst_time).total_seconds()) for t in annot.orbit_times]
+    idx = int(np.argmin(diffs))
+    vx, vy, vz = annot.orbit_velocities[idx]
+    return float(np.sqrt(vx**2 + vy**2 + vz**2))
+
+
+def _steering_doppler_rate(annot: S1Annotation, burst_idx: int) -> float:
     """
     Doppler rate k_psi [Hz/s] induced by the TOPS antenna steering.
 
-    k_psi = (2 f_0 / c) * v_eff * |ψ̇|
+    k_psi = (2 f_0 / c) * v_sat * |ψ̇|
 
-    where v_eff ≈ azimuth_pixel_spacing × PRF is the effective ground speed
-    and ψ̇ is the physical steering rate in rad/s.  k_psi > 0 for forward
+    v_sat is the satellite orbital speed [m/s] from the annotation state
+    vectors.  Using orbital speed (≈ 7 500 m/s) rather than the projected
+    ground speed (≈ 6 800 m/s) is critical: the TOPS antenna rotates at
+    rate ψ̇ in inertial space, so it is the inertial (orbital) velocity that
+    enters the Doppler rate formula.  Underestimating v_sat by ~10 % produces
+    a ~40 Hz/s residual chirp after deramping — the dominant source of
+    within-burst Doppler stripes.
+
+    ψ̇ is the physical steering rate in rad/s.  k_psi > 0 for forward
     steering (IW ≈ 7 500 Hz/s).
     """
-    v_eff    = annot.azimuth_pixel_spacing * annot.prf           # m/s
+    v_sat    = _orbital_speed(annot, burst_idx)                  # m/s
     psi_dot  = abs(annot.azimuth_steering_rate) * np.pi / 180    # rad/s
-    return 2.0 * annot.radar_frequency / C_LIGHT * v_eff * psi_dot
+    return 2.0 * annot.radar_frequency / C_LIGHT * v_sat * psi_dot
 
 
 def _deramp_rate(annot: S1Annotation, burst_idx: int) -> np.ndarray:
@@ -97,9 +120,9 @@ def _deramp_rate(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     -------
     np.ndarray, shape (n_samples,)
     """
-    k_a   = _fm_rate_at_burst(annot, burst_idx)    # < 0
-    k_psi = _steering_doppler_rate(annot)           # > 0
-    return -k_a * k_psi / (k_a - k_psi)            # < 0, varies with range
+    k_a   = _fm_rate_at_burst(annot, burst_idx)            # < 0
+    k_psi = _steering_doppler_rate(annot, burst_idx)       # > 0
+    return -k_a * k_psi / (k_a - k_psi)                   # < 0, varies with range
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -122,6 +122,9 @@ class S1Annotation:
     dc_estimates: list                # list[DcEstimate]
     azimuth_fm_rates: list            # list[AzimuthFmRate]
     geoloc_grid: dict                 # 'line','pixel','lat','lon','inc_angle' arrays
+    orbit_times: list                 # list[datetime]  state-vector times
+    orbit_positions: list             # list of [x, y, z] in metres (ECEF)
+    orbit_velocities: list            # list of [vx, vy, vz] in m/s (ECEF)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +222,23 @@ def parse_annotation(xml_path: str) -> S1Annotation:
         'incidence_angle': inc_arr,
     }
 
+    # Orbit state vectors (ECEF, metres / m s-1)
+    orbit_times, orbit_positions, orbit_velocities = [], [], []
+    for osv in root.findall('.//generalAnnotation/orbitList/orbit'):
+        orbit_times.append(_iso_to_datetime(osv.findtext('time')))
+        pos = osv.find('position')
+        orbit_positions.append([
+            float(pos.findtext('x')),
+            float(pos.findtext('y')),
+            float(pos.findtext('z')),
+        ])
+        vel = osv.find('velocity')
+        orbit_velocities.append([
+            float(vel.findtext('x')),
+            float(vel.findtext('y')),
+            float(vel.findtext('z')),
+        ])
+
     pol = root.findtext('.//adsHeader/polarisation').upper()
     sw = root.findtext('.//adsHeader/swath').upper()
 
@@ -243,6 +263,9 @@ def parse_annotation(xml_path: str) -> S1Annotation:
         dc_estimates=dc_estimates,
         azimuth_fm_rates=azimuth_fm_rates,
         geoloc_grid=geoloc_grid,
+        orbit_times=orbit_times,
+        orbit_positions=orbit_positions,
+        orbit_velocities=orbit_velocities,
     )
 
 
