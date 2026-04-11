@@ -157,43 +157,115 @@ def deramp_burst(burst: np.ndarray, annot: S1Annotation, burst_idx: int) -> np.n
     return (burst * chirp).astype(np.complex64)
 
 
-def _burst_hanning(lpb: int) -> np.ndarray:
+def _burst_window(lpb: int, overlap_lines: int) -> np.ndarray:
     """
-    Hanning window in azimuth time, normalised to approximate the partition-
-    of-unity condition Σ_j w²(τ − τ̄_j) = 1 at the burst-overlap region
-    (eq. 5 in the doc).
+    Partition-of-unity raised-cosine window for TOPS burst merging (eq. 5).
 
-    For IW's ≈ 30 % burst overlap, dividing by sqrt(mean(w²)) over the
-    overlap region gives a close-enough approximation for Doppler estimation.
+    A Hanning window satisfies Σ_j w²(τ−τ̄_j) = 1 only at 50 % overlap.
+    IW mode has ≈ 30 % overlap; using a Hanning taper leaves w_j² + w_{j+1}²
+    well below 1 in the transition zone, producing amplitude gaps in the
+    merged image.
+
+    This window is flat (1.0) in the non-overlap region and uses a raised-cosine
+    taper over the overlap at each end:
+
+        rising edge  (k = 0 … overlap_lines−1): w(k) = sin(π/2 · k/overlap_lines)
+        falling edge (k = lpb−overlap_lines … lpb−1): w(k) = cos(π/2 · k/overlap_lines)
+
+    which satisfies w_j(k)² + w_{j+1}(k)² = 1 exactly for any overlap fraction.
     """
-    w = np.hanning(lpb).astype(np.float32)
-    # Normalise so that two windows overlapping at 50 % square-sum to unity.
-    w /= np.sqrt(np.mean(w ** 2))
+    w = np.ones(lpb, dtype=np.float32)
+    if overlap_lines > 0:
+        t = np.arange(overlap_lines, dtype=np.float32) / overlap_lines
+        w[:overlap_lines]       = np.sin(np.pi / 2.0 * t)
+        w[lpb - overlap_lines:] = np.cos(np.pi / 2.0 * t)
     return w
+
+
+def _window_burst(
+    I_bcd: np.ndarray,
+    annot: S1Annotation,
+    burst_idx: int,
+    overlap_lines: int,
+) -> np.ndarray:
+    """
+    Apply the TOPS spectral window (Section 5.4.1, eq. 4):
+
+        I_cbdw = c2* ⊗ [(c2 ⊗ I_bcd) · w(· − τ̄_j)]
+
+    with  c2(τ) = exp(iπ k_psi τ²)  (steering Doppler chirp).
+
+    The c2 defocusing maps each Doppler frequency to its natural azimuth-time
+    position before the raised-cosine window is applied, so the partition-of-
+    unity condition is satisfied across the burst overlap region.
+
+    Implementation steps:
+        1. FFT(I_bcd) along azimuth
+        2. × C2            →  c2 ⊗ I_bcd  (defocus)
+        3. IFFT
+        4. × w(τ − τ̄_j)   →  raised-cosine window centred on burst
+        5. FFT
+        6. × C2*           →  c2* ⊗ (windowed)  (refocus)
+        7. IFFT
+    """
+    lpb   = I_bcd.shape[0]
+    k_psi = _steering_doppler_rate(annot, burst_idx)          # Hz/s, scalar > 0
+    w     = _burst_window(lpb, overlap_lines)
+
+    f  = np.fft.fftfreq(lpb, d=1.0 / annot.prf)                      # (lpb,) Hz
+    C2 = np.exp(-1j * np.pi * f**2 / k_psi).astype(np.complex64)     # (lpb,)
+
+    # Defocus: IFFT[ C2 · FFT[I_bcd] ]
+    I_defoc    = np.fft.ifft(C2[:, None] * np.fft.fft(I_bcd, axis=0), axis=0)
+    # Window in the defocused domain
+    I_windowed = (I_defoc * w[:, None]).astype(np.complex64)
+    # Refocus: IFFT[ C2* · FFT[I_windowed] ]
+    I_cbdw     = np.fft.ifft(C2.conj()[:, None] * np.fft.fft(I_windowed, axis=0), axis=0)
+
+    return I_cbdw.astype(np.complex64)
 
 
 def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
     """
-    Read, deramp, window and coherently merge all TOPS bursts (eq. 6).
+    Read, deramp, window and coherently merge all TOPS bursts (Section 5.4.1,
+    eq. 1–6).
 
-    Each burst is multiplied by a Hanning window before being added to the
-    output array; overlapping regions from adjacent bursts blend smoothly.
+    Each burst is deramped (eq. 1–2), spectrally windowed with the raised-cosine
+    partition-of-unity window (eq. 4–5), and summed into its correct azimuth
+    position (eq. 6).  The overlap_lines is computed from the inter-burst
+    interval so the window taper is exact for the actual IW overlap fraction.
 
     Returns
     -------
-    I_c : complex64, shape (n_bursts × linesPerBurst, samplesPerBurst)
+    I_c : complex64, shape (n_lines, samplesPerBurst)
     """
-    n_bursts = len(annot.bursts)
-    lpb      = annot.lines_per_burst
-    n_rg     = annot.samples_per_burst
-    w        = _burst_hanning(lpb)
+    lpb  = annot.lines_per_burst
+    n_rg = annot.samples_per_burst
+    ati  = annot.azimuth_time_interval
 
-    I_c = np.zeros((n_bursts * lpb, n_rg), dtype=np.complex64)
+    inter_burst_lines = int(round(
+        (annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+         ).total_seconds() / ati
+    ))
+    overlap_lines = lpb - inter_burst_lines
 
-    for j in range(n_bursts):
+    I_c = np.zeros((annot.n_lines, n_rg), dtype=np.complex64)
+
+    for j, burst in enumerate(annot.bursts):
+        az0 = int(round(
+            (burst.azimuth_time - annot.first_line_time).total_seconds() / ati
+        ))
+        az1 = az0 + lpb
+
         raw      = read_slc_burst(measurement_path, annot, j)
         deramped = deramp_burst(raw, annot, j)
-        I_c[j * lpb: (j + 1) * lpb, :] += (deramped * w[:, np.newaxis]).astype(np.complex64)
+
+        # Zero lines flagged invalid before windowing; these filled edge lines
+        # must not contribute to the overlap blend.
+        valid_lines = burst.first_valid_sample != -1
+        deramped[~valid_lines, :] = 0.0
+
+        I_c[az0:az1, :] += _window_burst(deramped, annot, j, overlap_lines)
 
     return I_c
 
@@ -204,19 +276,58 @@ def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
 
 def _block_p0_p1(block: np.ndarray) -> tuple[float, complex]:
     """
-    Lag-0 and lag-1 azimuth correlation coefficients for one tile.
+    Lag-0 and lag-1 azimuth correlation coefficients for one tile,
+    following the two-stage windowed procedure of Section 5.5.1
+    (eqs. 12–13).
 
-    The lag-1 estimator is the time-domain equivalent of the first inverse
-    Fourier coefficient of the azimuth power spectrum (eq. 10, 13):
+    Stage 1 — azimuth (inner): apply Hanning window h_az along azimuth,
+    then form per-range-column lag-1 products g1(t') and lag-0 power
+    g0(t'):
 
-        p0 = E[|I|²]
-        p1 = E[I(τ) I*(τ−1)]   (lag−1 in azimuth samples)
+        I_w(t', τ) = I_c(t', τ) · h_az(τ)
 
-    The phase of p1 gives the mean Doppler shift:
-        f_dc = PRF · arg(p1) / (2π)
+        g0(t') = Σ_τ |I_w(t', τ)|²                    (eq. 12, n = 0)
+        g1(t') = Σ_τ I_w(t', τ) · I_w*(t', τ−1)       (eq. 12, n = 1)
+
+    Stage 2 — range (outer): average per-column estimates over range
+    with h²_ra weights (Hanning squared, eq. 13):
+
+        p0 = Σ_t' h²_ra(t') g0(t') / Σ_t' h²_ra(t')
+        p1 = Σ_t' h²_ra(t') g1(t') / Σ_t' h²_ra(t')
+
+    Both windows are normalised to unit sum before use (eq. 11).
+
+    NOTE: the ϖ∆ correction (eq. 9, ϖ∆ = ϖPRF / (1 + γ/β)) is not
+    yet applied — the correct γ/β interpretation for deramped IW data
+    needs to be verified before implementation.
     """
-    p0 = float(np.mean(np.abs(block) ** 2))
-    p1 = complex(np.mean(block[1:, :] * np.conj(block[:-1, :])))
+    n_az, n_rg = block.shape
+
+    # h_az: Hanning along azimuth, normalised to unit sum (eq. 11)
+    haz = np.hanning(n_az).astype(np.float32)
+    haz /= haz.sum()
+
+    # h_ra: Hanning along range, normalised to unit sum (eq. 11)
+    hra = np.hanning(n_rg).astype(np.float32)
+    hra /= hra.sum()
+
+    # Stage 1 — apply h_az per range column
+    I_w = block * haz[:, None]   # (n_az, n_rg)
+
+    # Per-column lag-1 products → g1, shape (n_rg,)
+    g1 = np.sum(I_w[1:, :] * np.conj(I_w[:-1, :]), axis=0)
+
+    # Per-column lag-0 power → g0 via |I_w|² = |I_c|² · h_az² (Parseval, n=0)
+    g0 = np.sum(np.abs(I_w) ** 2, axis=0)
+
+    # Stage 2 — h²_ra weights over range (eq. 13)
+    w2    = hra ** 2
+    denom = float(np.sum(w2))
+    if denom < 1e-30:
+        return 0.0, complex(0.0)
+
+    p0 = float(np.sum(g0 * w2) / denom)
+    p1 = complex(np.sum(g1 * w2) / denom)
     return p0, p1
 
 
@@ -231,8 +342,10 @@ def estimate_correlation_grid(
     """
     Slide an estimation window over the merged image and compute (p0, p1).
 
-    Blocks where fewer than *min_valid_fraction* of pixels are non-zero
-    (i.e. mostly invalid SLC samples) are set to NaN.
+    Each block is passed to _block_p0_p1, which applies the two-stage
+    Hanning windowing (h_az in azimuth, h²_ra in range) per Section 5.5.1
+    eqs. 12–13.  Blocks where fewer than *min_valid_fraction* of pixels
+    are non-zero (mostly invalid SLC samples) are left as NaN.
 
     Parameters
     ----------
@@ -457,9 +570,10 @@ def compute_rvl(
     Compute the Radial Velocity Layer (RVL) from Sentinel-1 IW SLC bursts.
 
     Follows the ESA OCN RVL algorithm (Engen & Johnsen, DI-MPC-RVL-0534).
-    Each burst is processed independently so no estimation window ever crosses
-    a burst boundary (which would mix samples deramped with different chirp
-    rates and produce stripe artefacts).
+    Bursts are deramped, spectrally windowed (c2-based, eq. 4) and coherently
+    merged before correlation estimation, matching the algorithm description
+    in Section 5.4.  Estimation blocks therefore span burst boundaries
+    seamlessly without phase discontinuities.
 
     Parameters
     ----------
@@ -485,48 +599,30 @@ def compute_rvl(
     files = find_safe_files(safe_dir, subswath, polarisation)
     annot = parse_annotation(files['annotation'])
 
-    # Process each burst independently.  Deramping removes the TOPS azimuth
-    # ramp per-burst; estimation within each burst only avoids cross-burst
-    # correlation bias.
-    p0_list, p1_list, az_centers_list = [], [], []
-    rg_centers = None
-    f_dc_list  = []
+    # Step I — deramp, window and merge all bursts into one continuous image
+    I_c = merge_bursts(annot, files['measurement'])
 
-    for j in range(len(annot.bursts)):
-        # Step I — read and deramp this burst (Section 5.4)
-        raw      = read_slc_burst(files['measurement'], annot, j)
-        deramped = deramp_burst(raw, annot, j)
+    # Step II — estimate azimuth correlation over the full merged image
+    p0, p1, az_centers, rg_centers = estimate_correlation_grid(
+        I_c, block_az, block_rg, stride_az, stride_rg,
+    )
 
-        # Step II — azimuth correlation within this burst only (Section 5.5)
-        p0_j, p1_j, az_loc, rg_centers_j = estimate_correlation_grid(
-            deramped, block_az, block_rg, stride_az, stride_rg,
-        )
-        if rg_centers is None:
-            rg_centers = rg_centers_j
-
-        # Step III — Doppler centroid then subtract per-burst geometry.
-        f_dc_j, _, _ = correlation_to_doppler(p0_j, p1_j, annot.prf, annot.wavelength)
-        f_geom_j = _geom_doppler_annotation(annot, j, rg_centers_j).astype(np.float32)
-        f_dc_j  -= f_geom_j[np.newaxis, :]
-
-        p0_list.append(p0_j)
-        p1_list.append(p1_j)
-        f_dc_list.append(f_dc_j)
-        az_centers_list.append(az_loc + j * annot.lines_per_burst)
-
-    p0         = np.concatenate(p0_list,        axis=0)
-    p1         = np.concatenate(p1_list,        axis=0)
-    f_dc       = np.concatenate(f_dc_list,      axis=0)
-    az_centers = np.concatenate(az_centers_list, axis=0)
+    # Step III — Doppler centroid, subtract Hanning-blended geometric Doppler
+    f_dc, _, _ = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
+    f_geom     = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
+    f_dca      = f_dc - f_geom
 
     _, _, snr = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
-    v_r = (annot.wavelength / 2.0 * f_dc).astype(np.float32)
+    v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
-    # Step IV
+    # Step IV — descallop using the true inter-burst interval as period
     if do_descallop:
-        burst_period_rows = annot.lines_per_burst / stride_az
-        f_dc = descallop(f_dc, snr, burst_period_rows)
-        v_r  = (annot.wavelength / 2.0 * f_dc).astype(np.float32)
+        burst_dt_s = (
+            annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+        ).total_seconds()
+        burst_period_rows = burst_dt_s / annot.azimuth_time_interval / stride_az
+        f_dca = descallop(f_dca, snr, burst_period_rows)
+        v_r   = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
     # Step V
     lat, lon, inc = _geolocate_grid(annot, az_centers, rg_centers)
@@ -536,7 +632,7 @@ def compute_rvl(
     return xr.Dataset(
         {
             'doppler_hz': xr.DataArray(
-                f_dc, dims=dims,
+                f_dca, dims=dims,
                 attrs={'long_name': 'Estimated Doppler centroid', 'units': 'Hz'},
             ),
             'radial_vel': xr.DataArray(
@@ -594,6 +690,69 @@ def _geom_doppler_annotation(
     tau   = annot.slant_range_time_start + rg_centers / annot.range_sampling_rate
     dt    = tau - dc.t0
     return sum(c * dt ** k for k, c in enumerate(dc.geometry_poly))
+
+
+def _blended_geom_doppler_annotation(
+    annot: S1Annotation,
+    az_centers: np.ndarray,
+    rg_centers: np.ndarray,
+) -> np.ndarray:
+    """
+    Raised-cosine-weighted blend of per-burst geometric Doppler polynomials
+    for estimation blocks on the merged SAFE image.
+
+    Uses the same raised-cosine partition-of-unity weights as ``_window_burst``
+    so the subtracted geometric bias is consistent with the merged signal.
+
+    Returns
+    -------
+    float32, shape (n_out_az, n_out_rg)
+    """
+    lpb = annot.lines_per_burst
+    ati = annot.azimuth_time_interval
+
+    inter_burst_lines = int(round(
+        (annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+         ).total_seconds() / ati
+    ))
+    overlap_lines = lpb - inter_burst_lines
+
+    az_offsets = [
+        int(round((b.azimuth_time - annot.first_line_time).total_seconds() / ati))
+        for b in annot.bursts
+    ]
+
+    win = _burst_window(lpb, overlap_lines).astype(np.float64)
+
+    # Evaluate each burst's geometry polynomial at rg_centers once
+    f_geom_bursts = np.stack(
+        [_geom_doppler_annotation(annot, j, rg_centers).astype(np.float64)
+         for j in range(len(annot.bursts))],
+        axis=0,
+    )   # (n_bursts, n_out_rg)
+
+    n_out_rg = len(rg_centers)
+    f_geom   = np.zeros((len(az_centers), n_out_rg), dtype=np.float32)
+
+    for i, az in enumerate(az_centers):
+        blend  = np.zeros(n_out_rg, dtype=np.float64)
+        w2_sum = 0.0
+        for j, az0 in enumerate(az_offsets):
+            rel = int(az) - az0
+            if 0 <= rel < lpb:
+                # Use w² weights: the lag-1 estimator weights each burst's
+                # contribution by w²  (product of two adjacent w values),
+                # so the geometry subtraction must use the same w² weighting.
+                # The partition-of-unity Σw²=1 holds in the interior so no
+                # normalisation is needed there; w2_sum handles image edges
+                # where only one burst contributes with w < 1.
+                w2     = float(win[rel]) ** 2
+                blend += w2 * f_geom_bursts[j]
+                w2_sum += w2
+        if w2_sum > 0:
+            f_geom[i] = (blend / w2_sum).astype(np.float32)
+
+    return f_geom
 
 
 def _geom_doppler_at_pixels(par_path: str, rg_centers: np.ndarray) -> np.ndarray:
@@ -719,11 +878,11 @@ def merge_gamma_bursts(
     2. Applies a Hanning window to each burst (tapers toward zero at burst
        edges, suppressing discontinuities in the overlap region).
     3. **Adds** windowed bursts into a common output array.
-    4. Normalises by the sum of windows at each line so the amplitude in the
-       overlap is a weighted average rather than a coherent sum.
 
-    The normalisation preserves the phase (needed for Doppler estimation) while
-    giving approximately uniform amplitude across burst transitions.
+    Amplitude normalisation (dividing by the window sum) is intentionally
+    skipped: Doppler estimation only uses the complex phase, and dividing by
+    a real, positive weight cannot change arg(p1).  The overlap region has
+    lower amplitude, but the phase — and therefore f_dc — is unaffected.
 
     Parameters
     ----------
@@ -750,7 +909,6 @@ def merge_gamma_bursts(
     n_az_total = int(round((t1_global - t0_global) / dt)) + 1
 
     output = np.zeros((n_az_total, n_rg), dtype=np.complex64)
-    weight = np.zeros(n_az_total,         dtype=np.float32)
 
     w = np.hanning(lpb).astype(np.float32)
 
@@ -760,9 +918,6 @@ def merge_gamma_bursts(
         az1   = az0 + lpb
 
         output[az0:az1, :] += burst * w[:, np.newaxis]
-        weight[az0:az1]    += w
-
-    # output /= weight[:, np.newaxis]
 
     return output
 
@@ -805,9 +960,10 @@ def compute_rvl_gamma(
 
     Returns
     -------
-    xr.Dataset with variables ``doppler_hz``, ``radial_vel``, ``snr`` and
-    coordinates ``latitude``, ``longitude``, ``incidence_angle``,
-    ``az_pixel``, ``rg_pixel``.
+    xr.Dataset with variables ``f_dca`` (Doppler centroid anomaly [Hz]),
+    ``radial_vel`` [m/s], ``f_dc`` (observed Doppler centroid [Hz]),
+    ``snr``, and coordinates ``latitude``, ``longitude``,
+    ``incidence_angle``, ``az_pixel``, ``rg_pixel``.
     """
     annot = parse_annotation(annotation_xml)
 
@@ -840,7 +996,14 @@ def compute_rvl_gamma(
 
     # Step IV — descalloping
     if do_descallop:
-        burst_period_rows = annot.lines_per_burst / stride_az
+        # In the merged image, the burst period in SLC lines is the inter-burst
+        # interval (burst centre to burst centre), which is shorter than
+        # lines_per_burst because adjacent bursts overlap.  Using lines_per_burst
+        # here would search for scalloping at the wrong frequency.
+        burst_dt_s = (
+            annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+        ).total_seconds()
+        burst_period_rows = burst_dt_s / annot.azimuth_time_interval / stride_az
         f_dca = descallop(f_dca, snr, burst_period_rows)
         v_r  = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
@@ -853,7 +1016,8 @@ def compute_rvl_gamma(
         {
             'f_dca': xr.DataArray(
                 f_dca, dims=dims,
-                attrs={'long_name': 'Estimated Doppler centroid', 'units': 'Hz'},
+                attrs={'long_name': 'Doppler centroid anomaly (geometry subtracted)',
+                       'units': 'Hz'},
             ),
             'radial_vel': xr.DataArray(
                 v_r, dims=dims,
@@ -861,6 +1025,11 @@ def compute_rvl_gamma(
             ),
             'f_dc': xr.DataArray(
                 f_dc, dims=dims,
+                attrs={'long_name': 'Observed Doppler centroid (before geometry subtraction)',
+                       'units': 'Hz'},
+            ),
+            'snr': xr.DataArray(
+                snr, dims=dims,
                 attrs={'long_name': 'Signal-to-noise ratio estimate'},
             ),
         },
