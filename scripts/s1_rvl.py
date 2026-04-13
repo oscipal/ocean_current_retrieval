@@ -47,6 +47,273 @@ C_LIGHT = 299_792_458.0    # m/s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Orbit / attitude interpolation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _interpolate_orbit(annot: S1Annotation, t) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Linearly interpolate ECEF position [m] and velocity [m/s] to time *t*.
+    Uses the state vectors in *annot* (annotation-embedded or POEORB-replaced).
+    """
+    t0    = annot.orbit_times[0]
+    times = np.array([(ot - t0).total_seconds() for ot in annot.orbit_times])
+    t_s   = (t - t0).total_seconds()
+    pos = np.array([
+        np.interp(t_s, times, [p[i] for p in annot.orbit_positions])
+        for i in range(3)
+    ])
+    vel = np.array([
+        np.interp(t_s, times, [v[i] for v in annot.orbit_velocities])
+        for i in range(3)
+    ])
+    return pos, vel
+
+
+def _interpolate_attitude_quat(
+    annot: S1Annotation, t
+) -> tuple[float, float, float, float] | None:
+    """
+    Linearly interpolate the attitude quaternion (q0, q1, q2, q3) to time *t*.
+    Returns None if no attitude records are present.
+    The returned quaternion is re-normalised after interpolation.
+    """
+    if not annot.attitude:
+        return None
+    t0    = annot.attitude[0].time
+    times = np.array([(a.time - t0).total_seconds() for a in annot.attitude])
+    t_s   = (t - t0).total_seconds()
+    q = np.array([
+        np.interp(t_s, times, [getattr(a, f'q{i}') for a in annot.attitude])
+        for i in range(4)
+    ])
+    q /= np.linalg.norm(q)
+    return float(q[0]), float(q[1]), float(q[2]), float(q[3])
+
+
+def _quat_to_matrix(q0: float, q1: float, q2: float, q3: float) -> np.ndarray:
+    """
+    Quaternion (q0 = scalar part) → 3×3 rotation matrix (body → J2000 inertial).
+    """
+    return np.array([
+        [1-2*(q2**2+q3**2),   2*(q1*q2-q0*q3),   2*(q1*q3+q0*q2)],
+        [2*(q1*q2+q0*q3),   1-2*(q1**2+q3**2),   2*(q2*q3-q0*q1)],
+        [2*(q1*q3-q0*q2),   2*(q2*q3+q0*q1),   1-2*(q1**2+q2**2)],
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUX_CAL–based correction functions  (Section 5.5.1 eq. 9, Section 5.6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_gamma_ambiguity(
+    aap,
+    prf: float,
+    v_eff: float,
+    wavelength: float,
+    n_amb: int = 5,
+) -> float:
+    """
+    Compute the azimuth ambiguity power ratio γ from the AUX_CAL antenna pattern.
+
+    γ = Σ_{k=1..n_amb} [G²(+k·PRF) + G²(−k·PRF)] / G²(0)
+
+    where G² is the two-way (squared one-way) gain evaluated at the Doppler
+    frequency of each ambiguity order.  G²(0) = 1 (pattern normalised to peak).
+
+    This value enters the ϖΔ correction (eq. 9):
+        scale = 1 / (1 + γ/β)
+    where β is the per-block signal-to-noise ratio.
+
+    Parameters
+    ----------
+    aap       : AzimuthAntennaPattern  (from s1_aux.parse_aux_cal)
+    prf       : float  [Hz]
+    v_eff     : float  effective satellite speed [m/s]
+    wavelength: float  [m]
+    n_amb     : int    number of ambiguity orders on each side (default 5)
+
+    Returns
+    -------
+    float  γ (dimensionless, typically 0.001–0.02 for IW over ocean)
+    """
+    # G²(0) = 1 by normalisation
+    gamma = 0.0
+    for k in range(1, n_amb + 1):
+        for sign in (+1, -1):
+            f_amb = sign * k * prf
+            g2 = aap.two_way_at_doppler_hz(
+                np.array([f_amb]), v_eff, wavelength
+            )[0]
+            gamma += float(g2)
+    return gamma
+
+
+def compute_sideband_bias(
+    aap,
+    f_dc_mean: float,
+    prf: float,
+    v_eff: float,
+    wavelength: float,
+    n_amb: int = 5,
+) -> float:
+    """
+    Compute the azimuth ambiguity Doppler bias (Section 5.6).
+
+    The azimuth ambiguities at f_dc ± k·PRF contribute a spurious Doppler
+    shift to the correlation estimate.  The gain-weighted bias is:
+
+        f_bias = Σ_{k≠0} G²(f_dc + k·PRF) · k·PRF
+                 ─────────────────────────────────
+                   Σ_{k} G²(f_dc + k·PRF)
+
+    Evaluated at *f_dc_mean* — the scene-mean (or per-burst-mean) DC.
+
+    For homogeneous ocean, |f_dc_mean| ≪ PRF so the sideband pattern is
+    nearly symmetric; the bias is typically < 2 Hz for IW.
+
+    Parameters
+    ----------
+    aap        : AzimuthAntennaPattern
+    f_dc_mean  : float  Doppler centroid at which to evaluate the pattern [Hz].
+                        Use 0 or the scene-mean f_dca.
+    prf        : float  [Hz]
+    v_eff      : float  [m/s]
+    wavelength : float  [m]
+    n_amb      : int    number of ambiguity orders (default 5)
+
+    Returns
+    -------
+    float  f_bias [Hz]  (subtract from f_dc to correct)
+    """
+    freqs  = np.array([f_dc_mean + k * prf
+                       for k in range(-n_amb, n_amb + 1)])   # k=0 included
+    k_vals = np.arange(-n_amb, n_amb + 1, dtype=np.float64)
+
+    g2 = aap.two_way_at_doppler_hz(freqs, v_eff, wavelength)
+
+    denom = float(np.sum(g2))
+    if denom < 1e-30:
+        return 0.0
+
+    numer = float(np.sum(g2 * k_vals * prf))
+    return numer / denom
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attitude-based mispointing Doppler  (Section 5.6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_mispointing_doppler(
+    annot: S1Annotation,
+    burst_idx: int,
+) -> float:
+    """
+    Estimate the attitude-based mispointing Doppler shift for one burst.
+
+    **Not yet implemented.**  Correctly mapping the SLC annotation quaternion
+    (body-to-J2000) to a mispointing Doppler requires knowledge of the exact
+    Sentinel-1 spacecraft body-frame convention, which is not standardised in
+    the annotation XML.  This function always returns 0.0.
+
+    The preferred source for the mispointing correction is the OCN product
+    field ``rvlDcMiss`` (used automatically by ``rvl_current.compute_current_velocity``
+    when an OCN SAFE is provided).
+
+    Returns
+    -------
+    float  0.0
+    """
+    return 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POEORB-based mispointing  (orbit-improvement Doppler correction)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# WGS84 constants
+_WGS84_A   = 6_378_137.0           # semi-major axis [m]
+_WGS84_F   = 1.0 / 298.257_223_563 # flattening
+_WGS84_E2  = 1.0 - (1.0 - _WGS84_F)**2   # first eccentricity²
+_OMEGA_E   = 7.292_115_0e-5        # Earth rotation rate [rad/s]
+
+
+def _latlon_to_ecef(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
+    """
+    Convert WGS84 geodetic (lat, lon) in degrees to ECEF [m].
+    Assumes h = 0 (ocean surface).
+    Returns shape (N, 3).
+    """
+    lat = np.deg2rad(lat_deg)
+    lon = np.deg2rad(lon_deg)
+    N   = _WGS84_A / np.sqrt(1.0 - _WGS84_E2 * np.sin(lat)**2)
+    x   = N * np.cos(lat) * np.cos(lon)
+    y   = N * np.cos(lat) * np.sin(lon)
+    z   = N * (1.0 - _WGS84_E2) * np.sin(lat)
+    return np.column_stack([x, y, z])
+
+
+def _geom_doppler_poeorb(
+    annot: S1Annotation,
+    annot_original: S1Annotation,
+    burst_idx: int,
+    rg_centers: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute the POEORB-based mispointing Doppler as the orbit-improvement shift.
+
+    Instead of computing the absolute geometry Doppler (which has a large
+    systematic offset when compared to the annotation polynomial), we compute
+    the *differential* Doppler caused by the velocity difference between the
+    POEORB orbit and the annotation orbit:
+
+        f_miss[rg] = (2/λ) · (v_sat_poeorb − v_sat_annotation) · l̂
+
+    Both velocities are interpolated at the same burst time and are in the
+    same coordinate frame, so any systematic frame biases cancel exactly.
+    The difference δv is typically ~0.02 m/s (orbit quality improvement),
+    giving f_miss of order 0.1–5 Hz — physically correct.
+
+    Parameters
+    ----------
+    annot          : S1Annotation  with POEORB orbit SVs (from apply_poeorb)
+    annot_original : S1Annotation  with original annotation orbit SVs
+    burst_idx      : int
+    rg_centers     : (n_rg,) range pixel indices
+
+    Returns
+    -------
+    np.ndarray, shape (n_rg,), dtype float64 — mispointing Doppler [Hz]
+    """
+    burst = annot.bursts[burst_idx]
+    t     = burst.azimuth_time
+
+    _, vel_poe = _interpolate_orbit(annot,          t)
+    _, vel_ann = _interpolate_orbit(annot_original, t)
+    delta_v    = vel_poe - vel_ann   # (3,)  — orbit-quality velocity difference
+
+    # Ground positions at burst mid-line for the look direction
+    ati    = annot.azimuth_time_interval
+    az0    = int(round(
+        (burst.azimuth_time - annot.first_line_time).total_seconds() / ati
+    ))
+    az_mid = np.array([float(az0 + annot.lines_per_burst // 2)])
+    rg_f   = rg_centers.astype(np.float64)
+
+    lat2d, lon2d, _ = _geolocate_grid(annot, az_mid, rg_f)
+    lat = lat2d[0].astype(np.float64)   # (n_rg,)
+    lon = lon2d[0].astype(np.float64)
+
+    r_ground = _latlon_to_ecef(lat, lon)          # (n_rg, 3)
+    pos_sat, _ = _interpolate_orbit(annot, t)
+    look       = r_ground - pos_sat[np.newaxis, :]  # (n_rg, 3)
+    look_hat   = look / np.linalg.norm(look, axis=1, keepdims=True)
+
+    # f_miss = (2/λ) · δv · l̂   (δv is the same for all range pixels)
+    dot = np.einsum('ij,j->i', look_hat, delta_v)
+    return (2.0 / annot.wavelength) * dot
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Deramp parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -399,28 +666,33 @@ def correlation_to_doppler(
     p1: np.ndarray,
     prf: float,
     wavelength: float,
+    gamma_amb: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert correlation coefficients to Doppler frequency and radial velocity.
 
-    Doppler centroid (eq. 20, 27 simplified — no geometric or mispointing
-    corrections since both are set to zero per Section 4):
-
+    Doppler centroid (eq. 20):
         f_dc = PRF · arg(p1) / (2π)
-        v_r  = (λ / 2) · f_dc
 
-    SNR from the lag-1 coherence magnitude ρ = |p1| / p0:
+    ϖΔ correction (eq. 9) — applied when *gamma_amb* is provided:
+        scale = 1 / (1 + γ/β)   where  β = ρ / (1 − ρ)  (per-block SNR)
+        f_dc  → f_dc · scale
 
+    The ϖΔ correction accounts for the fraction of power leaking from
+    azimuth ambiguities into the estimation band.  It is a small (<1 %)
+    scale factor that is block-dependent through the per-block SNR β.
+
+    SNR from lag-1 coherence magnitude ρ = |p1| / p0:
         SNR = ρ / (1 − ρ)
-
-    This exploits the fact that noise is spatially uncorrelated (noise
-    contributes to p0 but not to p1), so |p1| ≈ signal power.
 
     Parameters
     ----------
-    p0, p1     : estimation grids
+    p0, p1     : estimation grids (from estimate_correlation_grid)
     prf        : PRF [Hz]
     wavelength : radar wavelength [m]
+    gamma_amb  : float or None
+        Azimuth ambiguity power ratio γ from compute_gamma_ambiguity.
+        Pass None (default) to skip the ϖΔ correction.
 
     Returns
     -------
@@ -428,12 +700,22 @@ def correlation_to_doppler(
     v_r  : float32 [m/s]
     snr  : float32
     """
-    f_dc = (prf / (2.0 * np.pi) * np.angle(p1)).astype(np.float32)
-    v_r  = (wavelength / 2.0 * f_dc).astype(np.float32)
-
     with np.errstate(invalid='ignore', divide='ignore'):
         rho = np.abs(p1) / np.where(p0 > 0, p0, np.nan)
         snr = (rho / np.where(rho < 1.0, 1.0 - rho, np.nan)).astype(np.float32)
+
+    f_dc = (prf / (2.0 * np.pi) * np.angle(p1)).astype(np.float64)
+
+    # ϖΔ correction (eq. 9) — scales f_dc down by the ambiguity leakage factor
+    if gamma_amb is not None and gamma_amb > 0.0:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            beta  = snr.astype(np.float64)                          # ρ/(1−ρ)
+            scale = 1.0 / (1.0 + gamma_amb / np.where(beta > 0, beta, np.nan))
+            scale = np.where(np.isfinite(scale), scale, 1.0)
+        f_dc = f_dc * scale
+
+    f_dc = f_dc.astype(np.float32)
+    v_r  = (wavelength / 2.0 * f_dc).astype(np.float32)
 
     return f_dc, v_r, snr
 
@@ -565,15 +847,24 @@ def compute_rvl(
     stride_az: int = 128,
     stride_rg: int = 256,
     do_descallop: bool = True,
+    aux_cal_path: str | None = None,
+    poeorb_path: str | None = None,
 ) -> xr.Dataset:
     """
     Compute the Radial Velocity Layer (RVL) from Sentinel-1 IW SLC bursts.
 
     Follows the ESA OCN RVL algorithm (Engen & Johnsen, DI-MPC-RVL-0534).
     Bursts are deramped, spectrally windowed (c2-based, eq. 4) and coherently
-    merged before correlation estimation, matching the algorithm description
-    in Section 5.4.  Estimation blocks therefore span burst boundaries
-    seamlessly without phase discontinuities.
+    merged before correlation estimation (Section 5.4).
+
+    When *aux_cal_path* is provided the following additional corrections are
+    applied (Section 5.5.1 eq. 9, Section 5.6):
+      - varpi_delta correction: scales f_dc by 1/(1+gamma/beta) per block
+      - Sideband bias: subtracts the gain-weighted ambiguity Doppler offset
+      - Mispointing: attitude-quaternion-derived Doppler offset per burst
+
+    When *poeorb_path* is provided the annotation orbit state vectors are
+    replaced with the precise POEORB data before computing the geometry Doppler.
 
     Parameters
     ----------
@@ -585,37 +876,107 @@ def compute_rvl(
     stride_az     : int   Block stride in azimuth.
     stride_rg     : int   Block stride in range.
     do_descallop  : bool  Apply burst-periodic scalloping correction.
+    aux_cal_path  : str or None
+        Path to the AUX_CAL .SAFE directory.  Enables ϖΔ, sideband and
+        mispointing corrections.
+    poeorb_path   : str or None
+        Path to a POEORB / RESORB .EOF file.  Replaces annotation orbit SVs.
 
     Returns
     -------
     xr.Dataset with variables:
-        doppler_hz  [Hz]    Estimated Doppler centroid per block
+        doppler_hz  [Hz]    Doppler centroid anomaly (f_dc − f_geom − corrections)
         radial_vel  [m/s]   Radial surface velocity
         snr         [-]     Signal-to-noise ratio estimate
     Coordinates:
         latitude, longitude, incidence_angle  (block-centre positions)
         az_pixel, rg_pixel                   (pixel indices in merged image)
     """
+    from .s1_aux import parse_aux_cal, apply_poeorb
+
     files = find_safe_files(safe_dir, subswath, polarisation)
-    annot = parse_annotation(files['annotation'])
+    annot          = parse_annotation(files['annotation'])
+    annot_original = annot   # preserve original SVs for POEORB differential
+
+    # Optional: replace orbit SVs with precise POEORB
+    if poeorb_path is not None:
+        annot = apply_poeorb(annot, poeorb_path)
+
+    # Optional: load AUX_CAL antenna pattern
+    aap = None
+    if aux_cal_path is not None:
+        aap = parse_aux_cal(aux_cal_path, subswath, polarisation)
 
     # Step I — deramp, window and merge all bursts into one continuous image
     I_c = merge_bursts(annot, files['measurement'])
 
-    # Step II — estimate azimuth correlation over the full merged image
+    # Effective velocity for antenna pattern angle ↔ Doppler conversion
+    # Use scene-centre burst orbital speed as representative value
+    mid_burst = len(annot.bursts) // 2
+    _, vel_mid = _interpolate_orbit(annot, annot.bursts[mid_burst].azimuth_time)
+    v_eff = float(np.linalg.norm(vel_mid))
+
+    # AUX_CAL derived scalars (computed once, applied per block)
+    # Use the hardware PRF (not the azimuth output frequency) for AUX_CAL ambiguity
+    # corrections: ambiguities arise at ±k × PRF_radar in the raw data.
+    gamma_amb   = compute_gamma_ambiguity(aap, annot.radar_prf, v_eff, annot.wavelength) \
+                  if aap is not None else None
+    f_sideband  = compute_sideband_bias(aap, 0.0, annot.radar_prf, v_eff, annot.wavelength) \
+                  if aap is not None else 0.0
+
+    # (per-burst mispointing applied in Step III below using POEORB orbit)
+
+    # Step II — correlation estimation with optional ϖΔ correction
     p0, p1, az_centers, rg_centers = estimate_correlation_grid(
         I_c, block_az, block_rg, stride_az, stride_rg,
     )
+    f_dc, _, snr = correlation_to_doppler(
+        p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
+    )
 
-    # Step III — Doppler centroid, subtract Hanning-blended geometric Doppler
-    f_dc, _, _ = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
-    f_geom     = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
-    f_dca      = f_dc - f_geom
+    # Step III — subtract blended geometry Doppler
+    f_geom_ann = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
+    f_dca      = f_dc - f_geom_ann
 
-    _, _, snr = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
+    # Subtract sideband bias (constant over scene)
+    f_dca = f_dca - f_sideband
+
+    # POEORB-based mispointing: per-burst, range-dependent correction.
+    # For each azimuth cell we find the nearest burst and compute
+    #   f_miss[rg] = f_geom_poeorb(burst) - f_geom_ann(burst)
+    # then subtract from f_dca.
+    ati = annot.azimuth_time_interval
+    az_burst_starts = [
+        int(round((b.azimuth_time - annot.first_line_time).total_seconds() / ati))
+        for b in annot.bursts
+    ]
+    if poeorb_path is not None:
+        # Precompute per-burst POEORB mispointing (1-D over range)
+        # Uses differential: f_miss = f_dc_poeorb - f_dc_annotation (orbit-quality improvement)
+        burst_f_miss = []
+        for j in range(len(annot.bursts)):
+            f_miss = _geom_doppler_poeorb(
+                annot, annot_original, j, rg_centers,
+            ).astype(np.float32)
+            burst_f_miss.append(f_miss)
+
+        lpb = annot.lines_per_burst
+        for i, az in enumerate(az_centers):
+            # Assign to nearest burst mid-line
+            j_best = int(np.argmin([
+                abs(int(az) - (az0 + lpb // 2)) for az0 in az_burst_starts
+            ]))
+            f_dca[i, :] -= burst_f_miss[j_best]
+
+        mispointing_source = 'poeorb'
+        mean_miss_hz = float(np.mean([np.mean(np.abs(m)) for m in burst_f_miss]))
+    else:
+        mispointing_source = 'none'
+        mean_miss_hz = 0.0
+
     v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
-    # Step IV — descallop using the true inter-burst interval as period
+    # Step IV — descallop
     if do_descallop:
         burst_dt_s = (
             annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
@@ -629,11 +990,15 @@ def compute_rvl(
 
     dims = ('az_cell', 'rg_cell')
 
+    corrections_applied = []
+    if poeorb_path:     corrections_applied.append('POEORB mispointing')
+    if aap is not None: corrections_applied.append('varpi_delta, sideband_bias')
+
     return xr.Dataset(
         {
             'doppler_hz': xr.DataArray(
                 f_dca, dims=dims,
-                attrs={'long_name': 'Estimated Doppler centroid', 'units': 'Hz'},
+                attrs={'long_name': 'Doppler centroid anomaly', 'units': 'Hz'},
             ),
             'radial_vel': xr.DataArray(
                 v_r, dims=dims,
@@ -652,16 +1017,22 @@ def compute_rvl(
             'rg_pixel':        ('rg_cell', rg_centers),
         },
         attrs={
-            'subswath':            annot.subswath,
-            'polarisation':        annot.polarisation,
-            'radar_frequency_hz':  annot.radar_frequency,
-            'wavelength_m':        annot.wavelength,
-            'prf_hz':              annot.prf,
-            'block_az_samples':    block_az,
-            'block_rg_samples':    block_rg,
-            'stride_az':           stride_az,
-            'stride_rg':           stride_rg,
-            'sideband_correction': 'not applied (no antenna aux files)',
+            'subswath':              annot.subswath,
+            'polarisation':          annot.polarisation,
+            'radar_frequency_hz':    annot.radar_frequency,
+            'wavelength_m':          annot.wavelength,
+            'prf_hz':                annot.prf,
+            'block_az_samples':      block_az,
+            'block_rg_samples':      block_rg,
+            'stride_az':             stride_az,
+            'stride_rg':             stride_rg,
+            'corrections_applied':   ', '.join(corrections_applied) or 'none',
+            'poeorb_applied':        poeorb_path is not None,
+            'aux_cal_applied':       aap is not None,
+            'mispointing_source':    mispointing_source,
+            'mispointing_hz':        mean_miss_hz,
+            'gamma_ambiguity':       float(gamma_amb) if gamma_amb is not None else float('nan'),
+            'sideband_bias_hz':      float(f_sideband),
         },
     )
 

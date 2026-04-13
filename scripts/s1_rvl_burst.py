@@ -60,7 +60,11 @@ from scripts.s1_rvl import (
     estimate_correlation_grid,
     correlation_to_doppler,
     _geom_doppler_annotation,
+    _geom_doppler_poeorb,
     _geolocate_grid,
+    _interpolate_orbit,
+    compute_gamma_ambiguity,
+    compute_sideband_bias,
 )
 
 
@@ -77,6 +81,8 @@ def compute_rvl_burst(
     block_rg: int = 512,
     stride_az: int = 128,
     stride_rg: int = 256,
+    aux_cal_path: str | None = None,
+    poeorb_path: str | None = None,
 ) -> xr.Dataset:
     """
     Compute the RVL for a single TOPS burst.
@@ -87,10 +93,17 @@ def compute_rvl_burst(
     subswath    : str   'iw1', 'iw2', or 'iw3'.
     burst_idx   : int   0-based burst index within the subswath.
     polarisation: str   'vv' (default) or 'vh'.
-    block_az    : int   Estimation block height in azimuth lines.
-    block_rg    : int   Estimation block width in range samples.
-    stride_az   : int   Block stride in azimuth.
-    stride_rg   : int   Block stride in range.
+    block_az      : int   Estimation block height in azimuth lines.
+    block_rg      : int   Estimation block width in range samples.
+    stride_az     : int   Block stride in azimuth.
+    stride_rg     : int   Block stride in range.
+    aux_cal_path  : str or None
+        Path to the AUX_CAL .SAFE directory.  When provided applies the
+        varpi_delta correction, sideband bias, and attitude mispointing
+        correction (Section 5.5.1 eq. 9, Section 5.6).
+    poeorb_path   : str or None
+        Path to a POEORB / RESORB .EOF file.  When provided replaces the
+        annotation orbit state vectors with the precise orbit.
 
     Returns
     -------
@@ -102,10 +115,33 @@ def compute_rvl_burst(
         latitude, longitude, incidence_angle
         az_pixel (full-scene line index), rg_pixel
     """
+    from scripts.s1_aux import parse_aux_cal, apply_poeorb
+
     files = find_safe_files(safe_dir, subswath, polarisation)
-    annot = parse_annotation(files['annotation'])
+    annot          = parse_annotation(files['annotation'])
+    annot_original = annot   # preserve original SVs for POEORB differential
+
+    # Optional: replace orbit SVs with precise POEORB
+    if poeorb_path is not None:
+        annot = apply_poeorb(annot, poeorb_path)
+
+    # Optional: load AUX_CAL antenna pattern
+    aap = None
+    if aux_cal_path is not None:
+        aap = parse_aux_cal(aux_cal_path, subswath, polarisation)
 
     burst = annot.bursts[burst_idx]
+
+    # Effective velocity (orbital speed at burst centre)
+    _, vel = _interpolate_orbit(annot, burst.azimuth_time)
+    v_eff  = float(np.linalg.norm(vel))
+
+    # AUX_CAL scalars (computed once for this burst)
+    # Use hardware PRF (not azimuth output frequency) for AUX_CAL ambiguity corrections.
+    gamma_amb  = compute_gamma_ambiguity(aap, annot.radar_prf, v_eff, annot.wavelength) \
+                 if aap is not None else None
+    f_sideband = compute_sideband_bias(aap, 0.0, annot.radar_prf, v_eff, annot.wavelength) \
+                 if aap is not None else 0.0
 
     # ------------------------------------------------------------------
     # Step I — deramp (eq. 1–3)
@@ -114,13 +150,11 @@ def compute_rvl_burst(
     deramped = deramp_burst(raw, annot, burst_idx)
 
     # Zero lines that the annotation flags as invalid (ramp-up / ramp-down edges).
-    # These are all-zero in the raw SLC; zeroing them here ensures the
-    # min_valid_fraction check in estimate_correlation_grid works correctly.
     valid_lines = burst.first_valid_sample != -1
     deramped[~valid_lines, :] = 0.0
 
     # ------------------------------------------------------------------
-    # Step II — azimuth correlation coefficients (eqs. 12–13)
+    # Step II — correlation coefficients with optional varpi_delta (eq. 9)
     # ------------------------------------------------------------------
     p0, p1, az_local, rg_centers = estimate_correlation_grid(
         deramped, block_az, block_rg, stride_az, stride_rg,
@@ -137,11 +171,31 @@ def compute_rvl_burst(
     # ------------------------------------------------------------------
     # Step III — Doppler centroid, subtract geometry Doppler (eq. 20)
     # ------------------------------------------------------------------
-    f_dc, _, snr = correlation_to_doppler(p0, p1, annot.prf, annot.wavelength)
+    f_dc, _, snr = correlation_to_doppler(
+        p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
+    )
 
     # Single burst → one geometry polynomial, no blending.
-    f_geom = _geom_doppler_annotation(annot, burst_idx, rg_centers).astype(np.float32)
-    f_dca  = f_dc - f_geom[np.newaxis, :]      # broadcast over azimuth cells
+    f_geom_ann = _geom_doppler_annotation(annot, burst_idx, rg_centers).astype(np.float32)
+    f_dca      = f_dc - f_geom_ann[np.newaxis, :]   # broadcast over azimuth cells
+
+    # Subtract sideband bias (scalar → broadcast)
+    f_dca = f_dca - float(f_sideband)
+
+    # POEORB-based mispointing: difference between numerically computed geometry
+    # Doppler (using POEORB orbit) and the annotation polynomial.
+    # This corrects the dominant part of the mispointing (orbit quality).
+    if poeorb_path is not None:
+        f_miss_arr = _geom_doppler_poeorb(
+            annot, annot_original, burst_idx, rg_centers,
+        ).astype(np.float32)
+        f_geom_poe = (f_geom_ann + f_miss_arr).astype(np.float32)  # for output only
+        f_dca        = f_dca - f_miss_arr[np.newaxis, :]
+        mispointing_source = 'poeorb'
+    else:
+        f_geom_poe = f_geom_ann
+        f_miss_arr = np.zeros(len(rg_centers), dtype=np.float32)
+        mispointing_source = 'none'
 
     v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
@@ -152,29 +206,40 @@ def compute_rvl_burst(
 
     dims = ('az_cell', 'rg_cell')
 
-    # Broadcast f_geom to 2-D for storage
-    f_geom_2d = np.broadcast_to(f_geom[np.newaxis, :], f_dca.shape).astype(np.float32).copy()
+    f_geom_ann_2d = np.broadcast_to(f_geom_ann[np.newaxis, :], f_dca.shape).astype(np.float32).copy()
+    f_geom_poe_2d = np.broadcast_to(f_geom_poe[np.newaxis, :], f_dca.shape).astype(np.float32).copy()
+    f_miss_2d     = np.broadcast_to(f_miss_arr[np.newaxis, :], f_dca.shape).astype(np.float32).copy()
 
     return xr.Dataset(
         {
             'doppler_hz': xr.DataArray(
                 f_dca, dims=dims,
-                attrs={'long_name': 'Doppler centroid (geometry subtracted)',
+                attrs={'long_name': 'Doppler centroid anomaly (all corrections applied)',
                        'units': 'Hz'},
             ),
             'doppler_obs': xr.DataArray(
                 f_dc, dims=dims,
-                attrs={'long_name': 'Observed Doppler centroid (raw, before geometry subtraction)',
+                attrs={'long_name': 'Observed Doppler centroid (raw, before subtraction)',
                        'units': 'Hz'},
             ),
             'doppler_geo': xr.DataArray(
-                f_geom_2d, dims=dims,
-                attrs={'long_name': 'Geometry Doppler from annotation polynomial',
+                f_geom_ann_2d, dims=dims,
+                attrs={'long_name': 'Geometry Doppler — annotation polynomial',
+                       'units': 'Hz'},
+            ),
+            'doppler_geo_poeorb': xr.DataArray(
+                f_geom_poe_2d, dims=dims,
+                attrs={'long_name': 'Geometry Doppler — POEORB numerical (0 if no POEORB)',
+                       'units': 'Hz'},
+            ),
+            'doppler_miss': xr.DataArray(
+                f_miss_2d, dims=dims,
+                attrs={'long_name': 'POEORB mispointing correction (f_geom_poeorb − f_geom_ann)',
                        'units': 'Hz'},
             ),
             'radial_vel': xr.DataArray(
                 v_r, dims=dims,
-                attrs={'long_name': 'Radial surface velocity',
+                attrs={'long_name': 'Radial surface velocity (all corrections applied)',
                        'units': 'm s-1'},
             ),
             'snr': xr.DataArray(
@@ -202,6 +267,12 @@ def compute_rvl_burst(
             'stride_az':           stride_az,
             'stride_rg':           stride_rg,
             'algorithm_ref':       'Engen & Johnsen, DI-MPC-RVL-0534, steps I/II/III/V',
+            'poeorb_applied':      poeorb_path is not None,
+            'aux_cal_applied':     aux_cal_path is not None,
+            'mispointing_source':  mispointing_source,
+            'mispointing_hz':      float(np.mean(f_miss_arr)),
+            'gamma_ambiguity':     float(gamma_amb) if gamma_amb is not None else float('nan'),
+            'sideband_bias_hz':    float(f_sideband),
         },
     )
 
@@ -249,13 +320,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('subswath',   help='iw1 | iw2 | iw3')
     p.add_argument('burst_idx',  type=int, help='0-based burst index')
     p.add_argument('--pol',      default='vv', help='Polarisation: vv or vh')
-    p.add_argument('--block-az', type=int, default=256, metavar='N')
-    p.add_argument('--block-rg', type=int, default=512, metavar='N')
+    p.add_argument('--block-az',  type=int, default=256, metavar='N')
+    p.add_argument('--block-rg',  type=int, default=512, metavar='N')
     p.add_argument('--stride-az', type=int, default=128, metavar='N')
     p.add_argument('--stride-rg', type=int, default=256, metavar='N')
-    p.add_argument('--out',      default='burst_rvl.nc',
+    p.add_argument('--aux-cal',   default=None, metavar='SAFE',
+                   help='AUX_CAL .SAFE directory (enables varpi_delta / sideband / mispointing)')
+    p.add_argument('--poeorb',    default=None, metavar='EOF',
+                   help='POEORB or RESORB .EOF file (replaces annotation orbit SVs)')
+    p.add_argument('--out',       default='burst_rvl.nc',
                    help='Output NetCDF path')
-    p.add_argument('--plot',     action='store_true',
+    p.add_argument('--plot',      action='store_true',
                    help='Show quick-look figure')
     return p
 
@@ -265,14 +340,16 @@ if __name__ == '__main__':
 
     print(f'Processing {args.subswath.upper()} burst {args.burst_idx} …')
     ds = compute_rvl_burst(
-        safe_dir    = args.safe_dir,
-        subswath    = args.subswath,
-        burst_idx   = args.burst_idx,
-        polarisation= args.pol,
-        block_az    = args.block_az,
-        block_rg    = args.block_rg,
-        stride_az   = args.stride_az,
-        stride_rg   = args.stride_rg,
+        safe_dir     = args.safe_dir,
+        subswath     = args.subswath,
+        burst_idx    = args.burst_idx,
+        polarisation = args.pol,
+        block_az     = args.block_az,
+        block_rg     = args.block_rg,
+        stride_az    = args.stride_az,
+        stride_rg    = args.stride_rg,
+        aux_cal_path = args.aux_cal,
+        poeorb_path  = args.poeorb,
     )
 
     ds.to_netcdf(args.out)

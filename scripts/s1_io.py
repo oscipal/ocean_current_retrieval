@@ -75,6 +75,18 @@ def _iso_to_unix(s: str) -> float:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class AttitudeRecord:
+    time: datetime
+    q0: float     # scalar part of quaternion (body-to-J2000)
+    q1: float
+    q2: float
+    q3: float
+    roll:  float  # absolute Euler angle [deg] in inertial frame
+    pitch: float
+    yaw:   float
+
+
+@dataclass
 class BurstInfo:
     idx: int
     azimuth_time: datetime
@@ -112,7 +124,8 @@ class S1Annotation:
     range_pixel_spacing: float        # m
     azimuth_pixel_spacing: float      # m
     azimuth_time_interval: float      # s
-    prf: float                        # Hz (azimuth frequency)
+    prf: float                        # Hz (azimuth / output sampling frequency)
+    radar_prf: float                  # Hz (hardware pulse repetition frequency; used for AUX_CAL ambiguity corrections)
     n_samples: int
     n_lines: int
     lines_per_burst: int
@@ -124,7 +137,8 @@ class S1Annotation:
     geoloc_grid: dict                 # 'line','pixel','lat','lon','inc_angle' arrays
     orbit_times: list                 # list[datetime]  state-vector times
     orbit_positions: list             # list of [x, y, z] in metres (ECEF)
-    orbit_velocities: list            # list of [vx, vy, vz] in m/s (ECEF)
+    orbit_velocities: list            # list of [vx, vy, vz] in m/s
+    attitude: list                    # list[AttitudeRecord]  (~1 Hz samples) (ECEF)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +162,8 @@ def parse_annotation(xml_path: str) -> S1Annotation:
     aps = float(ii.findtext('azimuthPixelSpacing'))
     ati = float(ii.findtext('azimuthTimeInterval'))
     prf = float(ii.findtext('azimuthFrequency'))
+    radar_prf_el = root.findtext('.//prf')
+    radar_prf = float(radar_prf_el) if radar_prf_el is not None else prf
     n_samples = int(ii.findtext('numberOfSamples'))
     n_lines = int(ii.findtext('numberOfLines'))
     first_line_time = _iso_to_datetime(ii.findtext('productFirstLineUtcTime'))
@@ -239,6 +255,22 @@ def parse_annotation(xml_path: str) -> S1Annotation:
             float(vel.findtext('z')),
         ])
 
+    # Attitude records (quaternion + Euler angles, ~1 Hz)
+    attitude = []
+    att_list = root.find('.//generalAnnotation/attitudeList')
+    if att_list is not None:
+        for rec in att_list:
+            attitude.append(AttitudeRecord(
+                time  = _iso_to_datetime(rec.findtext('time')),
+                q0    = float(rec.findtext('q0')),
+                q1    = float(rec.findtext('q1')),
+                q2    = float(rec.findtext('q2')),
+                q3    = float(rec.findtext('q3')),
+                roll  = float(rec.findtext('roll')),
+                pitch = float(rec.findtext('pitch')),
+                yaw   = float(rec.findtext('yaw')),
+            ))
+
     pol = root.findtext('.//adsHeader/polarisation').upper()
     sw = root.findtext('.//adsHeader/swath').upper()
 
@@ -254,6 +286,7 @@ def parse_annotation(xml_path: str) -> S1Annotation:
         azimuth_pixel_spacing=aps,
         azimuth_time_interval=ati,
         prf=prf,
+        radar_prf=radar_prf,
         n_samples=n_samples,
         n_lines=n_lines,
         lines_per_burst=lpb,
@@ -266,6 +299,7 @@ def parse_annotation(xml_path: str) -> S1Annotation:
         orbit_times=orbit_times,
         orbit_positions=orbit_positions,
         orbit_velocities=orbit_velocities,
+        attitude=attitude,
     )
 
 
