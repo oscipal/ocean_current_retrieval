@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n ocean_current python -c ' *)",
+      "Bash(conda run *)",
+      "Bash(grep *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import numpy\")",
+      "Bash(where python *)",
+      "Read(//c/Users/ottos/anaconda3/envs/**)",
+      "Read(//c/Users/ottos/miniconda3/envs/**)",
+      "Read(//c/Users/ottos/AppData/Local/anaconda3/**)",
+      "Bash('~/miniconda3/envs/ocean/bin/python' -c ' *)",
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c ' *)",
+      "Bash(python -)",
+      "Bash(python -c \"from scripts.s1_rvl import _geom_doppler_poeorb, compute_rvl; from scripts.s1_rvl_burst import compute_rvl_burst; from scripts.rvl_current import compute_current_velocity; print\\('imports OK'\\)\")",
+      "Bash(python -c \"import ast, sys; files = ['scripts/s1_rvl.py', 'scripts/s1_rvl_burst.py', 'scripts/rvl_current.py']; [print\\(f, 'OK'\\) or ast.parse\\(open\\(f\\).read\\(\\)\\) for f in files]; print\\('all syntax OK'\\)\")"
+    ]
+  }
+}

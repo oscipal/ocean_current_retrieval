@@ -102,8 +102,9 @@ def compute_rvl_burst(
         varpi_delta correction, sideband bias, and attitude mispointing
         correction (Section 5.5.1 eq. 9, Section 5.6).
     poeorb_path   : str or None
-        Path to a POEORB / RESORB .EOF file.  When provided replaces the
-        annotation orbit state vectors with the precise orbit.
+        Path to a POEORB / RESORB .EOF file.  When provided computes the
+        full POEORB-based geometry Doppler and subtracts it directly from
+        f_dc, bypassing the annotation polynomial entirely.
 
     Returns
     -------
@@ -175,27 +176,28 @@ def compute_rvl_burst(
         p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
     )
 
-    # Single burst → one geometry polynomial, no blending.
-    f_geom_ann = _geom_doppler_annotation(annot, burst_idx, rg_centers).astype(np.float32)
-    f_dca      = f_dc - f_geom_ann[np.newaxis, :]   # broadcast over azimuth cells
+    # Geometry Doppler: POEORB (preferred) or annotation polynomial (fallback).
+    # With POEORB the full geometry is computed from the precise orbit directly;
+    # the annotation polynomial does not appear in the output formula.
+    if poeorb_path is not None:
+        f_geom_poe = _geom_doppler_poeorb(
+            annot, annot_original, burst_idx, rg_centers,
+        ).astype(np.float32)
+        f_geom_ann = _geom_doppler_annotation(annot_original, burst_idx, rg_centers).astype(np.float32)
+        mispointing_source = 'poeorb'
+    else:
+        f_geom_ann = _geom_doppler_annotation(annot, burst_idx, rg_centers).astype(np.float32)
+        f_geom_poe = f_geom_ann
+        mispointing_source = 'none'
+
+    f_dca = f_dc - f_geom_poe[np.newaxis, :]   # broadcast over azimuth cells
 
     # Subtract sideband bias (scalar → broadcast)
     f_dca = f_dca - float(f_sideband)
 
-    # POEORB-based mispointing: difference between numerically computed geometry
-    # Doppler (using POEORB orbit) and the annotation polynomial.
-    # This corrects the dominant part of the mispointing (orbit quality).
-    if poeorb_path is not None:
-        f_miss_arr = _geom_doppler_poeorb(
-            annot, annot_original, burst_idx, rg_centers,
-        ).astype(np.float32)
-        f_geom_poe = (f_geom_ann + f_miss_arr).astype(np.float32)  # for output only
-        f_dca        = f_dca - f_miss_arr[np.newaxis, :]
-        mispointing_source = 'poeorb'
-    else:
-        f_geom_poe = f_geom_ann
-        f_miss_arr = np.zeros(len(rg_centers), dtype=np.float32)
-        mispointing_source = 'none'
+    # Diagnostic: mispointing differential (POEORB − annotation)
+    f_miss_arr = (f_geom_poe - f_geom_ann).astype(np.float32)
+
 
     v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 

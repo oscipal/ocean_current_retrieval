@@ -419,6 +419,77 @@ def retrieve_radial_current(
     return _compute_radial_current(rvl, owi=owi, antenna_side=antenna_side, wind_drift_alpha=wind_drift_alpha)
 
 
+def _decode_ocn_times(source_path: str, swath_index: int) -> np.ndarray:
+    """
+    Decode rvlZeroDopplerTime from the raw OCN NetCDF file.
+
+    The OCN stores time as a char array (rvlAzSize, rvlRaSize, length, rvlSwath).
+    Each azimuth row has a 26-char ISO timestamp at range cell 0.
+    Returns shape (rvlAzSize,) array of POSIX seconds (float64).
+    """
+    import netCDF4
+    from datetime import datetime, timezone
+
+    with netCDF4.Dataset(source_path) as ds:
+        raw = ds.variables['rvlZeroDopplerTime'][:]  # (az, ra, 26, swath)
+
+    # raw shape: (n_az, n_ra, 26, n_swath); use first range cell, selected swath
+    chars = raw[:, 0, :, swath_index]  # (n_az, 26), dtype S1
+
+    times = []
+    for row in chars:
+        # Join non-masked bytes; masked positions (separators) are fill b'-'
+        filled = row.filled(b'-')
+        s = b''.join(filled).decode('ascii').strip()
+        # Format: "2026-02-05 16:52:51.875345"
+        try:
+            t = datetime.strptime(s[:26], '%Y-%m-%d %H:%M:%S.%f').replace(
+                tzinfo=timezone.utc
+            )
+            times.append(t.timestamp())
+        except ValueError:
+            times.append(float('nan'))
+
+    return np.array(times)
+
+
+def extract_mispointing_per_burst(
+    rvl: xr.Dataset,
+    annot,
+) -> np.ndarray:
+    """
+    Extract one rvlDcMiss value per annotation burst by time-matching.
+
+    The OCN rvlZeroDopplerTime grid has 233 rows for ~10 annotation bursts.
+    Each OCN row is assigned to the nearest burst by azimuth time, then the
+    per-burst mean of rvlDcMiss is returned.
+
+    Parameters
+    ----------
+    rvl   : xr.Dataset  from load_rvl()
+    annot : S1Annotation  from s1_io.parse_annotation()
+
+    Returns
+    -------
+    np.ndarray, shape (n_bursts,)  [Hz]
+    """
+    swath_index = rvl.attrs.get('selected_swath', 0)
+    source_path = rvl.attrs['source_path']
+    ocn_sec = _decode_ocn_times(source_path, swath_index)
+
+    burst_sec = np.array([b.azimuth_time.timestamp() for b in annot.bursts])
+
+    # Assign each OCN row to nearest burst
+    diffs = np.abs(ocn_sec[:, None] - burst_sec[None, :])  # (n_ocn, n_bursts)
+    burst_assign = np.argmin(diffs, axis=1)                 # (n_ocn,)
+
+    dc_miss = rvl['rvlDcMiss'].values  # (n_ocn, n_range) after swath selection
+    return np.array([
+        np.nanmean(dc_miss[burst_assign == j])
+        for j in range(len(annot.bursts))
+    ])
+
+
 def process_ocn(
     safe_dir: str,
     polarisation: str | None = None,

@@ -203,38 +203,147 @@ def compute_sideband_bias(
 # Attitude-based mispointing Doppler  (Section 5.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_mispointing_doppler(
+def calibrate_boresight_from_ocn(
     annot: S1Annotation,
-    burst_idx: int,
-) -> float:
+    ocn_f_miss_per_burst: np.ndarray,
+) -> np.ndarray:
     """
-    Estimate the attitude-based mispointing Doppler shift for one burst.
+    Solve for the antenna boresight calibration vector from OCN rvlDcMiss data.
 
-    **Not yet implemented.**  Correctly mapping the SLC annotation quaternion
-    (body-to-J2000) to a mispointing Doppler requires knowledge of the exact
-    Sentinel-1 spacecraft body-frame convention, which is not standardised in
-    the annotation XML.  This function always returns 0.0.
+    Because Sentinel-1 uses Zero-Doppler Steering (ZDS), the nominal attitude
+    keeps the look direction perpendicular to v_sat, so the nominal Doppler
+    contribution is exactly zero.  The mispointing Doppler becomes:
 
-    The preferred source for the mispointing correction is the OCN product
-    field ``rvlDcMiss`` (used automatically by ``rvl_current.compute_current_velocity``
-    when an OCN SAFE is provided).
+        f_miss_j = (2/λ) · v_body_j · b_cal
+        v_body_j = R_actual_j.T @ v_j2000_j   (satellite velocity in body frame)
+
+    This is a linear system  A · b_cal = rhs  with one row per burst.
+    b_cal absorbs both boresight direction and any constant scale — do NOT
+    normalise it.  Calibrate once from a scene with a known OCN rvlDcMiss,
+    then reuse b_cal on any future scene.
+
+    Parameters
+    ----------
+    annot               : S1Annotation  (must contain attitude records)
+    ocn_f_miss_per_burst: np.ndarray, shape (n_bursts,)  [Hz]
 
     Returns
     -------
-    float  0.0
+    np.ndarray, shape (3,)  — calibration boresight vector (body frame)
     """
-    return 0.0
+    rhs = np.asarray(ocn_f_miss_per_burst, dtype=np.float64).ravel()
+    n_bursts = len(rhs)
+    if n_bursts != len(annot.bursts):
+        import warnings
+        warnings.warn(
+            f'calibrate_boresight_from_ocn: ocn_f_miss_per_burst has {n_bursts} entries '
+            f'but annotation has {len(annot.bursts)} bursts. '
+            'Truncating to the shorter length.',
+            UserWarning, stacklevel=2,
+        )
+        n_bursts = min(n_bursts, len(annot.bursts))
+        rhs = rhs[:n_bursts]
+    A   = np.zeros((n_bursts, 3))
+
+    for j, burst in enumerate(annot.bursts[:n_bursts]):
+        t = burst.azimuth_time
+        q = _interpolate_attitude_quat(annot, t)
+        if q is None:
+            continue
+        R_actual    = _quat_to_matrix(*q)
+        _, vel_ecef = _interpolate_orbit(annot, t)
+        vel_j2000   = _ecef_to_j2000(vel_ecef, _gmst_rad(t))
+        v_body      = R_actual.T @ vel_j2000
+        A[j]        = (2.0 / annot.wavelength) * v_body
+
+    b_cal, _, _, _ = np.linalg.lstsq(A, rhs, rcond=None)
+    return b_cal
+
+
+def compute_mispointing_doppler(
+    annot: S1Annotation,
+    burst_idx: int,
+    boresight_cal: np.ndarray | None = None,
+) -> float:
+    """
+    Attitude-based mispointing Doppler for one burst [Hz].
+
+    Uses the data-driven formula (valid for any body-frame convention):
+
+        v_body  = R_actual.T @ v_j2000
+        f_miss  = (2/λ) · v_body · boresight_cal
+
+    boresight_cal must be obtained from calibrate_boresight_from_ocn() first.
+
+    Returns 0.0 if boresight_cal is None or no attitude data is present.
+    """
+    if boresight_cal is None:
+        return 0.0
+
+    t = annot.bursts[burst_idx].azimuth_time
+    q = _interpolate_attitude_quat(annot, t)
+    if q is None:
+        return 0.0
+
+    R_actual    = _quat_to_matrix(*q)
+    _, vel_ecef = _interpolate_orbit(annot, t)
+    vel_j2000   = _ecef_to_j2000(vel_ecef, _gmst_rad(t))
+    v_body      = R_actual.T @ vel_j2000
+
+    return float((2.0 / annot.wavelength) * np.dot(v_body, boresight_cal))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POEORB-based mispointing  (orbit-improvement Doppler correction)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# WGS84 constants
+# WGS84 / Earth constants
 _WGS84_A   = 6_378_137.0           # semi-major axis [m]
 _WGS84_F   = 1.0 / 298.257_223_563 # flattening
 _WGS84_E2  = 1.0 - (1.0 - _WGS84_F)**2   # first eccentricity²
 _OMEGA_E   = 7.292_115_0e-5        # Earth rotation rate [rad/s]
+_J2000_EPOCH_JD = 2_451_545.0      # Julian Date of J2000.0 (2000-01-01 12:00 TT)
+
+
+def _gmst_rad(t) -> float:
+    """
+    Greenwich Mean Sidereal Time [rad] at UTC datetime *t*.
+
+    Uses the IAU 1982 formula (accurate to ~0.1 s over 1950–2050):
+        GMST = 24110.54841 + 8640184.812866·T + 0.093104·T² − 6.2e−6·T³  [s]
+    where T = Julian centuries from J2000.0.
+
+    This gives the rotation angle by which ECEF lags J2000 (ECI): a vector
+    in J2000 is obtained by rotating the ECEF vector by +GMST around Z.
+    """
+    from datetime import timezone
+    import math
+    # Julian Date
+    t_utc = t.astimezone(timezone.utc).replace(tzinfo=None)
+    from datetime import datetime
+    t_j2000 = datetime(2000, 1, 1, 12, 0, 0)
+    dt_days  = (t_utc - t_j2000).total_seconds() / 86400.0
+    T        = dt_days / 36525.0                          # Julian centuries
+    gmst_s   = (24110.54841
+                + 8640184.812866 * T
+                + 0.093104       * T**2
+                - 6.2e-6         * T**3)
+    gmst_rad = (gmst_s % 86400.0) / 86400.0 * 2.0 * math.pi
+    return gmst_rad
+
+
+def _ecef_to_j2000(v_ecef: np.ndarray, gmst: float) -> np.ndarray:
+    """
+    Rotate a vector (or matrix columns) from ECEF to J2000 by angle *gmst* [rad].
+    R_z(+gmst): [ cos  -sin  0 ]
+                [ sin   cos  0 ]
+                [  0     0   1 ]
+    """
+    c, s = np.cos(gmst), np.sin(gmst)
+    Rz = np.array([[c, -s, 0.0],
+                   [s,  c, 0.0],
+                   [0.0, 0.0, 1.0]])
+    return Rz @ v_ecef
 
 
 def _latlon_to_ecef(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
@@ -259,19 +368,18 @@ def _geom_doppler_poeorb(
     rg_centers: np.ndarray,
 ) -> np.ndarray:
     """
-    Compute the POEORB-based mispointing Doppler as the orbit-improvement shift.
+    Compute the full POEORB-based geometry Doppler for one burst.
 
-    Instead of computing the absolute geometry Doppler (which has a large
-    systematic offset when compared to the annotation polynomial), we compute
-    the *differential* Doppler caused by the velocity difference between the
-    POEORB orbit and the annotation orbit:
+    The annotation geometryDcPolynomial is orbit-predicted but uses the
+    lower-accuracy annotation state vectors.  POEORB provides more precise
+    velocities.  Rather than re-deriving the zero-Doppler steering model from
+    scratch, the improvement is added as a differential:
 
-        f_miss[rg] = (2/λ) · (v_sat_poeorb − v_sat_annotation) · l̂
+        f_geom_poeorb[rg] = f_geom_ann[rg] + (2/λ) · (v_poeorb − v_ann) · l̂
 
-    Both velocities are interpolated at the same burst time and are in the
-    same coordinate frame, so any systematic frame biases cancel exactly.
-    The difference δv is typically ~0.02 m/s (orbit quality improvement),
-    giving f_miss of order 0.1–5 Hz — physically correct.
+    Both velocities are evaluated at the same burst time and the same look
+    vectors, so systematic frame offsets cancel.  The velocity difference is
+    typically ~0.01–0.05 m/s, giving a correction of order 0.1–5 Hz.
 
     Parameters
     ----------
@@ -282,16 +390,18 @@ def _geom_doppler_poeorb(
 
     Returns
     -------
-    np.ndarray, shape (n_rg,), dtype float64 — mispointing Doppler [Hz]
+    np.ndarray, shape (n_rg,), dtype float64
+        Full POEORB-based geometry Doppler [Hz].  Subtract this directly from
+        the observed f_dc to obtain f_dca without touching the annotation poly.
     """
     burst = annot.bursts[burst_idx]
     t     = burst.azimuth_time
 
     _, vel_poe = _interpolate_orbit(annot,          t)
     _, vel_ann = _interpolate_orbit(annot_original, t)
-    delta_v    = vel_poe - vel_ann   # (3,)  — orbit-quality velocity difference
+    delta_v    = vel_poe - vel_ann   # (3,)  — orbit-quality velocity correction
 
-    # Ground positions at burst mid-line for the look direction
+    # Ground positions at burst mid-line for look vectors
     ati    = annot.azimuth_time_interval
     az0    = int(round(
         (burst.azimuth_time - annot.first_line_time).total_seconds() / ati
@@ -300,17 +410,17 @@ def _geom_doppler_poeorb(
     rg_f   = rg_centers.astype(np.float64)
 
     lat2d, lon2d, _ = _geolocate_grid(annot, az_mid, rg_f)
-    lat = lat2d[0].astype(np.float64)   # (n_rg,)
+    lat = lat2d[0].astype(np.float64)
     lon = lon2d[0].astype(np.float64)
 
-    r_ground = _latlon_to_ecef(lat, lon)          # (n_rg, 3)
+    r_ground   = _latlon_to_ecef(lat, lon)
     pos_sat, _ = _interpolate_orbit(annot, t)
-    look       = r_ground - pos_sat[np.newaxis, :]  # (n_rg, 3)
+    look       = r_ground - pos_sat[np.newaxis, :]
     look_hat   = look / np.linalg.norm(look, axis=1, keepdims=True)
 
-    # f_miss = (2/λ) · δv · l̂   (δv is the same for all range pixels)
-    dot = np.einsum('ij,j->i', look_hat, delta_v)
-    return (2.0 / annot.wavelength) * dot
+    f_miss = (2.0 / annot.wavelength) * np.einsum('ij,j->i', look_hat, delta_v)
+    f_geom_ann = _geom_doppler_annotation(annot_original, burst_idx, rg_centers)
+    return f_geom_ann + f_miss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -934,45 +1044,46 @@ def compute_rvl(
         p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
     )
 
-    # Step III — subtract blended geometry Doppler
-    f_geom_ann = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
-    f_dca      = f_dc - f_geom_ann
-
-    # Subtract sideband bias (constant over scene)
-    f_dca = f_dca - f_sideband
-
-    # POEORB-based mispointing: per-burst, range-dependent correction.
-    # For each azimuth cell we find the nearest burst and compute
-    #   f_miss[rg] = f_geom_poeorb(burst) - f_geom_ann(burst)
-    # then subtract from f_dca.
+    # Step III — subtract geometry Doppler.
+    # With POEORB: use per-burst full POEORB geometry (no annotation polynomial visible).
+    # Without:     use blended annotation polynomial.
     ati = annot.azimuth_time_interval
     az_burst_starts = [
         int(round((b.azimuth_time - annot.first_line_time).total_seconds() / ati))
         for b in annot.bursts
     ]
     if poeorb_path is not None:
-        # Precompute per-burst POEORB mispointing (1-D over range)
-        # Uses differential: f_miss = f_dc_poeorb - f_dc_annotation (orbit-quality improvement)
-        burst_f_miss = []
-        for j in range(len(annot.bursts)):
-            f_miss = _geom_doppler_poeorb(
-                annot, annot_original, j, rg_centers,
-            ).astype(np.float32)
-            burst_f_miss.append(f_miss)
-
+        # Compute full POEORB-based geometry per burst (range-dependent)
+        burst_f_geom_poe = [
+            _geom_doppler_poeorb(annot, annot_original, j, rg_centers).astype(np.float32)
+            for j in range(len(annot.bursts))
+        ]
+        burst_f_geom_ann = [
+            _geom_doppler_annotation(annot_original, j, rg_centers).astype(np.float32)
+            for j in range(len(annot.bursts))
+        ]
+        # Build per-block geometry grid from nearest burst
+        f_geom = np.zeros_like(f_dc, dtype=np.float32)
         lpb = annot.lines_per_burst
         for i, az in enumerate(az_centers):
-            # Assign to nearest burst mid-line
             j_best = int(np.argmin([
                 abs(int(az) - (az0 + lpb // 2)) for az0 in az_burst_starts
             ]))
-            f_dca[i, :] -= burst_f_miss[j_best]
-
+            f_geom[i, :] = burst_f_geom_poe[j_best]
+        f_dca = f_dc - f_geom
         mispointing_source = 'poeorb'
-        mean_miss_hz = float(np.mean([np.mean(np.abs(m)) for m in burst_f_miss]))
+        mean_miss_hz = float(np.mean([
+            np.mean(np.abs(burst_f_geom_poe[j] - burst_f_geom_ann[j]))
+            for j in range(len(annot.bursts))
+        ]))
     else:
+        f_geom_ann = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
+        f_dca      = f_dc - f_geom_ann
         mispointing_source = 'none'
         mean_miss_hz = 0.0
+
+    # Subtract sideband bias (constant over scene)
+    f_dca = f_dca - f_sideband
 
     v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 

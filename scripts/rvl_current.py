@@ -320,17 +320,18 @@ def compute_current_velocity(
       lat, lon, inc   SAR grid coordinates
       mispointing_source  'ocn' | 'attitude' | 'none'
 
-    Mispointing correction priority
-    --------------------------------
-    1. OCN rvlDcMiss (most accurate) — used when *ocn_safe* is provided.
-       v_miss is applied EXTERNALLY: v_sar_current = -our_rv + v_miss - v_stokes - v_wave
-    2. POEORB orbit-differential — used when *poeorb_path* is provided but no
-       *ocn_safe*.  The correction is already baked into our_rv (computed
-       inside compute_rvl_burst), so v_miss is returned for reporting only and
-       NOT added again to the formula.
-       v_sar_current = -our_rv - v_stokes - v_wave
-    3. Zero — when neither is available.
-       v_sar_current = -our_rv - v_stokes - v_wave
+    Mispointing correction
+    ----------------------
+    When *poeorb_path* is provided, ``compute_rvl_burst`` computes the full
+    POEORB-based geometry Doppler and subtracts it directly from f_dc.  The
+    annotation polynomial is NOT used in this path.  The resulting ``our_rv``
+    is already mispointing-free, and v_miss is recorded for reference only.
+
+    When only *ocn_safe* is provided (no POEORB), mispointing is NOT corrected
+    in ``our_rv``; the v_miss from OCN rvlDcMiss is recorded for comparison.
+
+    Final current formula (both cases):
+        v_sar_current = −our_rv − v_stokes − v_wave
     """
     # ---- Step 1: single-burst RVL (with optional aux corrections) --------
     print('  Running single-burst RVL …')
@@ -384,37 +385,29 @@ def compute_current_velocity(
     look_az = np.deg2rad(heading + 90.0)           # right-looking
     print(f'    heading={heading:.1f} deg  ->  look_az={np.rad2deg(look_az):.1f} deg')
 
-    # ---- Step 3: mispointing correction ----------------------------------
+    # ---- Step 3: mispointing note ------------------------------------------
+    # When POEORB was provided, compute_rvl_burst used the full POEORB-based
+    # geometry Doppler (f_dc - f_geom_poeorb) so our_rv is already corrected.
+    # When only OCN is available, our_rv used the annotation polynomial which
+    # does NOT include mispointing — v_miss from OCN rvlDcMiss is for reference.
+    # In either case v_miss is NOT added to the formula below; it is stored for
+    # diagnostic purposes only.
     wavelength = our_ds.attrs['wavelength_m']
-    # mispointing_baked_in: True when the correction is already inside our_rv
-    # and must NOT be added again to the current formula.
-    mispointing_baked_in = False
-
     if ocn_raw is not None:
-        # Best: OCN rvlDcMiss (pre-computed by ESA from attitude + antenna model).
-        # Applied EXTERNALLY: v_current = -our_rv + v_miss - v_stokes - v_wave
-        print('  Loading mispointing from OCN …')
         dc_miss_ocn = match_to_sar_grid(
             our_lat, our_lon, ocn_raw['lat'], ocn_raw['lon'], ocn_raw['dc_miss'],
         )
         v_miss = (wavelength / 2.0 * dc_miss_ocn).astype(np.float32)
-        mispointing_source = 'ocn'
-    elif our_ds.attrs.get('mispointing_source') == 'poeorb':
-        # POEORB orbit-differential mispointing is already baked into our_rv.
-        # Extract the mean value for reporting only; do NOT add to formula.
+        mispointing_source = 'ocn_ref_only'
+    elif our_ds.attrs.get('mispointing_source') in ('poeorb', 'attitude'):
         f_miss_hz = float(our_ds.attrs.get('mispointing_hz', 0.0))
-        v_miss = np.full(our_lat.shape, wavelength / 2.0 * f_miss_hz,
-                         dtype=np.float32)
-        mispointing_source = 'poeorb'
-        mispointing_baked_in = True
-        print(f'  POEORB mispointing (baked into our_rv): {f_miss_hz:.3f} Hz '
-              f'({wavelength/2.0*f_miss_hz:.4f} m/s mean)')
+        v_miss = np.full(our_lat.shape, wavelength / 2.0 * f_miss_hz, dtype=np.float32)
+        mispointing_source = our_ds.attrs['mispointing_source'] + '_ref_only'
     else:
         v_miss = np.zeros(our_lat.shape, dtype=np.float32)
         mispointing_source = 'none'
-        print('  No mispointing correction available (no OCN and no POEORB)')
-
-    print(f'    v_miss range: [{np.nanmin(v_miss):.3f}, {np.nanmax(v_miss):.3f}] m/s')
+    print(f'  Mispointing for reference ({mispointing_source}): '
+          f'[{np.nanmin(v_miss):.3f}, {np.nanmax(v_miss):.3f}] m/s (NOT applied to our_rv)')
 
     # ---- Step 4: Stokes drift correction ---------------------------------
     print('  Loading ERA5 Stokes drift …')
@@ -431,21 +424,10 @@ def compute_current_velocity(
     print(f'    v_wave range: [{np.nanmin(v_wave):.3f}, {np.nanmax(v_wave):.3f}] m/s')
 
     # ---- Step 6: current-only SAR velocity (away-from-satellite = positive) -
-    # our_rv = λ/2 · f_dca uses "toward satellite = positive" convention.
-    # OCN rvlRadVel and the glo12 model use "away from satellite = positive".
-    #
-    # When mispointing source is OCN (external, not in our_rv):
-    #   v_current = −our_rv + v_miss_ocn − v_stokes − v_wave
-    #   v_miss_ocn is in toward-positive (OCN rvlDcMiss sign convention),
-    #   so + v_miss cancels against −our_rv.
-    #
-    # When mispointing is POEORB or none (already baked in, or absent):
+    # our_rv = λ/2 · f_dca  (toward satellite = positive).
+    # The annotation polynomial absorbs mispointing, so no explicit v_miss term.
     #   v_current = −our_rv − v_stokes − v_wave
-    if mispointing_baked_in or mispointing_source == 'none':
-        v_sar_current = (-our_rv - v_stokes - v_wave).astype(np.float32)
-    else:
-        # OCN external mispointing
-        v_sar_current = (-our_rv + v_miss - v_stokes - v_wave).astype(np.float32)
+    v_sar_current = (-our_rv - v_stokes - v_wave).astype(np.float32)
 
     # ---- Step 7: OCN current-only velocity (only when OCN product available)
     if ocn_raw is not None:
