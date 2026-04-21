@@ -14,7 +14,15 @@
       "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c ' *)",
       "Bash(python -)",
       "Bash(python -c \"from scripts.s1_rvl import _geom_doppler_poeorb, compute_rvl; from scripts.s1_rvl_burst import compute_rvl_burst; from scripts.rvl_current import compute_current_velocity; print\\('imports OK'\\)\")",
-      "Bash(python -c \"import ast, sys; files = ['scripts/s1_rvl.py', 'scripts/s1_rvl_burst.py', 'scripts/rvl_current.py']; [print\\(f, 'OK'\\) or ast.parse\\(open\\(f\\).read\\(\\)\\) for f in files]; print\\('all syntax OK'\\)\")"
+      "Bash(python -c \"import ast, sys; files = ['scripts/s1_rvl.py', 'scripts/s1_rvl_burst.py', 'scripts/rvl_current.py']; [print\\(f, 'OK'\\) or ast.parse\\(open\\(f\\).read\\(\\)\\) for f in files]; print\\('all syntax OK'\\)\")",
+      "WebSearch",
+      "WebFetch(domain:www.sciencedirect.com)",
+      "WebFetch(domain:agupubs.onlinelibrary.wiley.com)",
+      "WebFetch(domain:www.mdpi.com)",
+      "WebFetch(domain:link.springer.com)",
+      "WebFetch(domain:www.researchgate.net)",
+      "WebFetch(domain:eo4society.esa.int)",
+      "WebFetch(domain:www.tandfonline.com)"
     ]
   }
 }
