@@ -1,29 +1,26 @@
 # Ocean Current Retrieval from SAR Doppler Centroid Anomalies
 
-Retrieval of ocean surface current velocities from spaceborne SAR imagery using the **Doppler Centroid Anomaly (DCA)** method. The measured Doppler centroid of an SAR scene contains contributions from satellite geometry, Earth rotation, surface waves, and ocean currents. By isolating the anomalous component, radial surface current velocities can be estimated.
+Retrieval of ocean surface current radial velocities from spaceborne SAR imagery using the Doppler Centroid Anomaly (DCA) method. The measured Doppler centroid of a SAR scene contains contributions from satellite geometry, instrument biases, surface waves and ocean currents. By subtracting all known contributions the residual gives the radial surface current velocity.
 
-Currently targets ESA **BIOMASS** (P-band, ~435 MHz) and **Sentinel-1** (C-band) SAR data.
-
-For Sentinel-1, this repository currently contains two separate code paths:
-- `scripts/s1_rvl.py` and `scripts/s1_ocn.py` work from Level-1 SLC data and implement the retrieval side of the project.
-- `scripts/s1_ocn_product.py` is a standalone reader for Level-2 OCN SAFE products. It opens the delivered NetCDF files and returns the `rvl`, `owi`, and `osw` groups as `xarray` datasets. It is useful for inspection and comparison, but is not currently wired into the main analysis workflow elsewhere in this repo.
+The main focus is Sentinel-1 IW TOPS data in C-band. Some earlier exploratory work on BIOMASS P-band data is also in the repo.
 
 ---
 
 ## Method Overview
 
 ```
-Measured DC  =  Geometry DC  +  Earth rotation DC  +  Wave DC  +  Current DC
-                     ↑                                               ↑
-              (from annotation             DCA =  Measured DC  -  Geometry DC  -  ...
-               polynomials)
+Observed DC  =  Geometry DC  +  Instrument bias  +  Wave DC  +  Mispointing  +  Current DC
 ```
 
-1. Estimate the measured Doppler centroid from the SLC using FFT or CDE
-2. Subtract the geometry-induced DC (from annotation polynomials)
-3. Calibrate instrument bias using a desert scene (stationary surface → residual = bias)
-4. Subtract remaining contributions (Earth rotation, wind/waves)
-5. Convert residual DCA to radial current velocity: `v_r = DCA * λ / (2 sin θ)`
+1. Read the SLC burst and deramp the TOPS chirp
+2. Estimate lag-0/lag-1 azimuth correlation coefficients (p0, p1) per block
+3. Convert p1 to Doppler centroid; apply AUX_CAL ambiguity and sideband corrections
+4. Subtract geometry Doppler computed from POEORB precision orbit
+5. Subtract ERA5 Stokes drift and wave Doppler bias
+6. Apply OCN rvlDcMiss mispointing correction
+7. Convert residual DCA to radial velocity: v_r = DCA * lambda / 2
+
+The full pipeline with plots and explanations is in `notebooks/rvl_pipeline_walkthrough.ipynb`.
 
 ---
 
@@ -31,24 +28,41 @@ Measured DC  =  Geometry DC  +  Earth rotation DC  +  Wave DC  +  Current DC
 
 ```
 notebooks/
-  desert_DCA.ipynb        # DC estimation and DCA computation from BIOMASS scenes
-  DCA_predictions.ipynb   # Predicted DCA from reference ocean current data
-  DCA_approximation.ipynb # Combined DC measurement and geometry correction
-  s1_desert.ipynb         # Sentinel-1 burst-level DC estimation (desert calibration)
+  rvl_pipeline_walkthrough.ipynb  # Main step-by-step Sentinel-1 RVL pipeline
+  s1_ocean.ipynb                  # Ocean scene processing
+  s1_ocn_burst.ipynb              # Burst-level OCN product exploration
+  s1_ocn_gamma.ipynb              # Ambiguity ratio investigation
+  s1_ocn_safe.ipynb               # OCN SAFE product reader/inspection
+  desert_DCA.ipynb                # DC estimation from BIOMASS desert scenes
+  desert_DCA_new.ipynb            # Updated desert DCA workflow
+  DCA_predictions.ipynb           # Predicted DCA from reference current data
+  DCA_approximation.ipynb         # DC measurement and geometry correction
+  s1_desert.ipynb                 # Sentinel-1 burst-level DC estimation
+  nisar.ipynb                     # NISAR exploratory work
 
 scripts/
-  io.py                   # Generic SLC file I/O
-  s1_io.py                # Sentinel-1 SAFE discovery and annotation parsing
-  s1_rvl.py               # Sentinel-1 RVL retrieval from SLC bursts
-  s1_ocn.py               # Sentinel-1 OCN-style products derived from SLC inputs
-  ocean_currents.py       # Copernicus Marine NetCDF loading and GeoTIFF export
-  plotting.py             # DC map and spectrum visualisation
-  s1_ocn_product.py       # Direct Sentinel-1 Level-2 OCN SAFE reader
+  s1_io.py                        # Sentinel-1 SAFE discovery and annotation parsing
+  s1_rvl.py                       # Core RVL retrieval (deramp, correlation, Doppler)
+  s1_rvl_burst.py                 # Burst-level RVL helpers
+  s1_aux.py                       # AUX_CAL and POEORB parsing and application
+  s1_ocn.py                       # OCN-style products derived from SLC inputs
+  s1_ocn_product.py               # Level-2 OCN SAFE reader (returns xarray datasets)
+  rvl_current.py                  # Ocean current extraction (Stokes, wave bias, GLO12)
+  compare_to_ocn.py               # Comparison between SLC-derived and OCN RVL
+  download_era5_scene.py          # ERA5 wind and wave data download for a scene
+  doppler.py                      # Generic Doppler estimation utilities
+  ocean_currents.py               # Copernicus Marine NetCDF loading and GeoTIFF export
+  io.py                           # Generic SLC file I/O
+  plotting.py                     # Visualisation helpers
+  corrections/
+    geometry.py                   # Geometry Doppler and POEORB correction
+    bias.py                       # Instrument bias corrections
+    ionosphere.py                 # Ionospheric correction utilities
 
-data/
-  Biomass_data/           # BIOMASS SLC scenes (.slc, .slc.par, annotation XML)
-  S1_data/                # Sentinel-1 burst SLC data
-  current_data/           # Reference ocean current NetCDF (Copernicus Marine)
+plots/                            # Output figures
+papers/                           # Reference algorithm documents and papers
+shell_commands/
+  burst_extraction.sh             # Burst extraction helper
 ```
 
 ---
@@ -56,11 +70,13 @@ data/
 ## Data Sources
 
 | Data | Product | Resolution |
-|---|---|---|
-| BIOMASS L1a SLC | [ESA MAAP Explorer](https://explorer.maap.eo.esa.int/?q=BiomassLevel1a) | — |
-| Ocean currents (NRT) | [MULTIOBS_GLO_PHY_MYNRT_015_003](https://data.marine.copernicus.eu/product/MULTIOBS_GLO_PHY_MYNRT_015_003/description) | 0.125° |
-| Ocean currents (forecast) | [GLOBAL_ANALYSISFORECAST_PHY_001_024](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_PHY_001_024/description) | 0.083° |
-| Ionosphere TEC | [https://cddis.nasa.gov/archive/gnss/products/ionex/2026/] | - |
+|------|---------|------------|
+| Sentinel-1 SLC | ESA Copernicus Open Access Hub | IW ~20 x 5 m |
+| Sentinel-1 OCN | ESA Copernicus Open Access Hub | ~1 km |
+| AUX_CAL / POEORB | ESA auxiliary file server | |
+| Ocean currents | [CMEMS GLO12 GLOBAL_ANALYSISFORECAST_PHY_001_024](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_PHY_001_024/description) | 1/12° |
+| ERA5 wind and waves | [Copernicus Climate Data Store](https://cds.climate.copernicus.eu) | ~31 km |
+| BIOMASS L1a SLC | [ESA MAAP Explorer](https://explorer.maap.eo.esa.int/?q=BiomassLevel1a) | |
 
 ---
 
