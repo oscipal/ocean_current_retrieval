@@ -398,7 +398,7 @@ def compute_current_velocity(
             our_lat, our_lon, ocn_raw['lat'], ocn_raw['lon'], ocn_raw['dc_miss'],
         )
         v_miss = (wavelength / 2.0 * dc_miss_ocn).astype(np.float32)
-        mispointing_source = 'ocn_ref_only'
+        mispointing_source = 'ocn'
     elif our_ds.attrs.get('mispointing_source') in ('poeorb', 'attitude'):
         f_miss_hz = float(our_ds.attrs.get('mispointing_hz', 0.0))
         v_miss = np.full(our_lat.shape, wavelength / 2.0 * f_miss_hz, dtype=np.float32)
@@ -425,9 +425,12 @@ def compute_current_velocity(
 
     # ---- Step 6: current-only SAR velocity (away-from-satellite = positive) -
     # our_rv = λ/2 · f_dca  (toward satellite = positive).
-    # The annotation polynomial absorbs mispointing, so no explicit v_miss term.
-    #   v_current = −our_rv − v_stokes − v_wave
-    v_sar_current = (-our_rv - v_stokes - v_wave).astype(np.float32)
+    # Apply OCN mispointing when available, matching the walkthrough notebook:
+    #   v_current = −our_rv + v_miss − v_stokes − v_wave
+    if ocn_raw is not None:
+        v_sar_current = (-our_rv + v_miss - v_stokes - v_wave).astype(np.float32)
+    else:
+        v_sar_current = (-our_rv - v_stokes - v_wave).astype(np.float32)
 
     # ---- Step 7: OCN current-only velocity (only when OCN product available)
     if ocn_raw is not None:

@@ -22,7 +22,12 @@
       "WebFetch(domain:link.springer.com)",
       "WebFetch(domain:www.researchgate.net)",
       "WebFetch(domain:eo4society.esa.int)",
-      "WebFetch(domain:www.tandfonline.com)"
+      "WebFetch(domain:www.tandfonline.com)",
+      "Bash(python3 *)",
+      "Bash(C:/Users/ottos/miniconda3/python.exe check_aux.py)",
+      "Bash(C:/Users/ottos/miniconda3/envs/s1/python.exe check_aux.py)",
+      "Bash(C:/Users/ottos/miniconda3/python.exe -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe check_aux.py)"
     ]
   }
 }
