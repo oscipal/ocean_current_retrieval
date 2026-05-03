@@ -29,6 +29,8 @@ Pipeline (Section 5 of the document):
   Step V   : Geolocate the output grid (Section 5.10).
 """
 
+from datetime import timedelta
+
 import numpy as np
 import xarray as xr
 from scipy.interpolate import RectBivariateSpline
@@ -44,6 +46,36 @@ from .s1_io import (
 from .io import read_slc, parse_slc_par
 
 C_LIGHT = 299_792_458.0    # m/s
+S1_AZIMUTH_PANELS = 14
+
+
+def burst_valid_sample_mask(burst, n_samples: int) -> np.ndarray:
+    """
+    Boolean mask of valid SLC samples for one Sentinel-1 TOPS burst.
+
+    The annotation gives first/last valid range sample for every azimuth line.
+    Lines with firstValidSample == -1 contain no valid samples.
+    """
+    first = np.asarray(burst.first_valid_sample, dtype=np.int64)
+    last = np.asarray(burst.last_valid_sample, dtype=np.int64)
+    line = np.arange(n_samples, dtype=np.int64)[None, :]
+    return (first[:, None] >= 0) & (line >= first[:, None]) & (line <= last[:, None])
+
+
+def apply_burst_valid_sample_mask(data: np.ndarray, burst) -> np.ndarray:
+    """Zero all samples outside the per-line valid range annotated for a burst."""
+    mask = burst_valid_sample_mask(burst, data.shape[1])
+    data[~mask] = 0.0
+    return mask
+
+
+def _burst_center_time(annot: S1Annotation, burst_idx: int):
+    """Zero-Doppler time at the centre sample of a TOPS burst."""
+    burst = annot.bursts[burst_idx]
+    center_line = 0.5 * (annot.lines_per_burst - 1)
+    return burst.azimuth_time + timedelta(
+        seconds=center_line * annot.azimuth_time_interval
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,6 +325,78 @@ def compute_mispointing_doppler(
     return float((2.0 / annot.wavelength) * np.dot(v_body, boresight_cal))
 
 
+def zds_yaw_rad(annot: 'S1Annotation', burst_idx: int) -> float:
+    """
+    Nominal Zero-Doppler Steering yaw angle [rad] for one burst.
+
+    S1 yaws to keep the antenna perpendicular to the *relative* velocity
+    (satellite − Earth-rotation target velocity).  In the Local Orbital
+    Reference Frame (LORF: x=along-track, y=orbit-normal, z=nadir) the
+    required yaw is:
+
+        ψ_ZDS = arctan2(v_earth_across, v_along)
+
+    where v_earth_across is the across-LORF component of Earth rotation at
+    the satellite position and v_along = |v_sat_ecef|.
+    """
+    t = annot.bursts[burst_idx].azimuth_time
+    pos_ecef, vel_ecef = _interpolate_orbit(annot, t)
+    v_mag = np.linalg.norm(vel_ecef)
+
+    # LORF axes (approximate — sufficient for <0.01° yaw accuracy)
+    z_lorf = -pos_ecef / np.linalg.norm(pos_ecef)   # nadir
+    x_lorf =  vel_ecef / v_mag                       # along-track
+    y_lorf = np.cross(z_lorf, x_lorf)
+    y_lorf /= np.linalg.norm(y_lorf)                 # orbit-normal / across-track
+
+    # Earth rotation velocity at the satellite position
+    omega_e = np.array([0.0, 0.0, _OMEGA_E])
+    v_earth = np.cross(omega_e, pos_ecef)
+
+    v_across = float(np.dot(v_earth, y_lorf))
+    return float(np.arctan2(v_across, v_mag))
+
+
+def attitude_yaw_rad(annot: 'S1Annotation', t) -> float | None:
+    """
+    Actual yaw angle [rad] from the annotation attitude records at time *t*.
+
+    The annotation stores Euler yaw in degrees relative to the LORF.
+    Returns None if no attitude records are present.
+    """
+    if not annot.attitude:
+        return None
+    t0    = annot.attitude[0].time
+    times = np.array([(a.time - t0).total_seconds() for a in annot.attitude])
+    t_s   = (t - t0).total_seconds()
+    return float(np.radians(np.interp(t_s, times, [a.yaw for a in annot.attitude])))
+
+
+def mispointing_doppler_from_yaw(
+    annot: 'S1Annotation',
+    burst_idx: int,
+) -> float:
+    """
+    Mispointing Doppler [Hz] from the yaw deviation relative to nominal ZDS.
+
+    f_miss = (2/λ) · |v_sat| · (ψ_actual − ψ_ZDS)
+
+    This is the dominant term for Sentinel-1 IW mode.  Returns 0.0 if
+    no attitude records are available.
+    """
+    t = annot.bursts[burst_idx].azimuth_time
+    yaw_actual = attitude_yaw_rad(annot, t)
+    if yaw_actual is None:
+        return 0.0
+
+    psi_zds = zds_yaw_rad(annot, burst_idx)
+    delta_yaw = yaw_actual - psi_zds
+
+    _, vel_ecef = _interpolate_orbit(annot, t)
+    v_mag = float(np.linalg.norm(vel_ecef))
+    return float((2.0 / annot.wavelength) * v_mag * delta_yaw)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # POEORB-based mispointing  (orbit-improvement Doppler correction)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,8 +542,8 @@ def _fm_rate_at_burst(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     -------
     np.ndarray, shape (n_samples,)
     """
-    burst = annot.bursts[burst_idx]
-    afr   = _nearest_estimate(annot.azimuth_fm_rates, burst.azimuth_time)
+    burst_time = _burst_center_time(annot, burst_idx)
+    afr   = _nearest_estimate(annot.azimuth_fm_rates, burst_time)
     tau   = slant_range_time_vector(annot)          # (n_samples,)
     dt    = tau - afr.t0
     return sum(c * dt**k for k, c in enumerate(afr.poly))  # Hz/s
@@ -454,7 +558,7 @@ def _orbital_speed(annot: S1Annotation, burst_idx: int) -> float:
     angular sweep rate of the antenna in inertial space, not the ground-track
     speed.
     """
-    burst_time = annot.bursts[burst_idx].azimuth_time
+    burst_time = _burst_center_time(annot, burst_idx)
     diffs = [abs((t - burst_time).total_seconds()) for t in annot.orbit_times]
     idx = int(np.argmin(diffs))
     vx, vy, vz = annot.orbit_velocities[idx]
@@ -479,7 +583,12 @@ def _steering_doppler_rate(annot: S1Annotation, burst_idx: int) -> float:
     steering (IW ≈ 7 500 Hz/s).
     """
     v_sat    = _orbital_speed(annot, burst_idx)                  # m/s
-    psi_dot  = abs(annot.azimuth_steering_rate) * np.pi / 180    # rad/s
+    # Sentinel-1 annotates the effective TOPS steering rate. Section 5.4.1
+    # converts it to the physical antenna steering rate before deramping.
+    steering_rate = annot.azimuth_steering_rate / (
+        1.0 - 1.0 / float(S1_AZIMUTH_PANELS ** 2)
+    )
+    psi_dot  = abs(steering_rate) * np.pi / 180    # rad/s
     return 2.0 * annot.radar_frequency / C_LIGHT * v_sat * psi_dot
 
 
@@ -527,7 +636,9 @@ def deramp_burst(burst: np.ndarray, annot: S1Annotation, burst_idx: int) -> np.n
     """
     lpb = annot.lines_per_burst
     k_s = _deramp_rate(annot, burst_idx)                               # (n_samples,)
-    t_az = (np.arange(lpb) - lpb / 2.0) * annot.azimuth_time_interval # (lpb,) [s]
+    t_az = (
+        np.arange(lpb, dtype=np.float64) - 0.5 * (lpb - 1)
+    ) * annot.azimuth_time_interval # (lpb,) [s]
 
     # Broadcast to (lpb, n_samples)
     chirp = np.exp(1j * np.pi * k_s[np.newaxis, :] * t_az[:, np.newaxis] ** 2)
@@ -637,10 +748,9 @@ def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
         raw      = read_slc_burst(measurement_path, annot, j)
         deramped = deramp_burst(raw, annot, j)
 
-        # Zero lines flagged invalid before windowing; these filled edge lines
-        # must not contribute to the overlap blend.
-        valid_lines = burst.first_valid_sample != -1
-        deramped[~valid_lines, :] = 0.0
+        # Zero samples outside the per-line valid range before windowing; these
+        # filled edge samples must not contribute to the overlap blend.
+        apply_burst_valid_sample_mask(deramped, burst)
 
         I_c[az0:az1, :] += _window_burst(deramped, annot, j, overlap_lines)
 
@@ -651,7 +761,7 @@ def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
 # Step II — Azimuth correlation coefficients  (Section 5.5)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _block_p0_p1(block: np.ndarray) -> tuple[float, complex]:
+def _block_p0_p1(block: np.ndarray, valid_mask: np.ndarray | None = None) -> tuple[float, complex]:
     """
     Lag-0 and lag-1 azimuth correlation coefficients for one tile,
     following the two-stage windowed procedure of Section 5.5.1
@@ -688,6 +798,9 @@ def _block_p0_p1(block: np.ndarray) -> tuple[float, complex]:
     hra = np.hanning(n_rg).astype(np.float32)
     hra /= hra.sum()
 
+    if valid_mask is not None:
+        block = np.where(valid_mask, block, 0.0)
+
     # Stage 1 — apply h_az per range column
     I_w = block * haz[:, None]   # (n_az, n_rg)
 
@@ -715,6 +828,7 @@ def estimate_correlation_grid(
     stride_az: int = 128,
     stride_rg: int = 256,
     min_valid_fraction: float = 0.8,
+    valid_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Slide an estimation window over the merged image and compute (p0, p1).
@@ -729,7 +843,10 @@ def estimate_correlation_grid(
     I_c                 : complex64, shape (n_az, n_rg)
     block_az, block_rg  : estimation block dimensions [samples]
     stride_az, stride_rg: block stride [samples]
-    min_valid_fraction  : skip blocks with too many zero pixels
+    min_valid_fraction  : skip blocks with too many invalid pixels
+    valid_mask          : optional boolean mask, same shape as I_c. When
+                          provided, validity comes from annotation-derived
+                          sample support instead of non-zero complex values.
 
     Returns
     -------
@@ -739,6 +856,10 @@ def estimate_correlation_grid(
     rg_centers : int array, range pixel centres in I_c
     """
     n_az, n_rg = I_c.shape
+    if valid_mask is not None and valid_mask.shape != I_c.shape:
+        raise ValueError(
+            f'valid_mask shape {valid_mask.shape} does not match I_c shape {I_c.shape}'
+        )
 
     az_starts = np.arange(0, n_az - block_az + 1, stride_az)
     rg_starts = np.arange(0, n_rg - block_rg + 1, stride_rg)
@@ -747,17 +868,24 @@ def estimate_correlation_grid(
     n_out_rg = len(rg_starts)
 
     p0_grid = np.full((n_out_az, n_out_rg), np.nan, dtype=np.float32)
-    p1_grid = np.zeros((n_out_az, n_out_rg), dtype=np.complex64)
+    p1_grid = np.full((n_out_az, n_out_rg), np.nan + 1j * np.nan, dtype=np.complex64)
 
     for i, az0 in enumerate(az_starts):
         for j, rg0 in enumerate(rg_starts):
             block = I_c[az0: az0 + block_az, rg0: rg0 + block_rg]
+            mask_block = None if valid_mask is None else valid_mask[
+                az0: az0 + block_az, rg0: rg0 + block_rg
+            ]
 
-            valid_frac = np.count_nonzero(block) / block.size
+            valid_frac = (
+                np.count_nonzero(block) / block.size
+                if mask_block is None
+                else np.count_nonzero(mask_block) / mask_block.size
+            )
             if valid_frac < min_valid_fraction:
                 continue
 
-            p0, p1 = _block_p0_p1(block)
+            p0, p1 = _block_p0_p1(block, mask_block)
             p0_grid[i, j] = p0
             p1_grid[i, j] = p1
 
@@ -814,7 +942,10 @@ def correlation_to_doppler(
         rho = np.abs(p1) / np.where(p0 > 0, p0, np.nan)
         snr = (rho / np.where(rho < 1.0, 1.0 - rho, np.nan)).astype(np.float32)
 
+    valid = (p0 > 0) & np.isfinite(p0) & np.isfinite(p1.real) & np.isfinite(p1.imag)
+
     f_dc = (prf / (2.0 * np.pi) * np.angle(p1)).astype(np.float64)
+    f_dc = np.where(valid, f_dc, np.nan)
 
     # ϖΔ correction (eq. 9) — scales f_dc down by the ambiguity leakage factor
     if gamma_amb is not None and gamma_amb > 0.0:
@@ -959,6 +1090,8 @@ def compute_rvl(
     do_descallop: bool = True,
     aux_cal_path: str | None = None,
     poeorb_path: str | None = None,
+    debug: bool = False,
+    deramp_diagnostics: bool = False,
 ) -> xr.Dataset:
     """
     Compute the Radial Velocity Layer (RVL) from Sentinel-1 IW SLC bursts.
@@ -1044,6 +1177,63 @@ def compute_rvl(
         p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
     )
 
+    f_dc_raw = f_dc.copy()
+    f_dc_radar_prf = (f_dc_raw * (annot.radar_prf / annot.prf)).astype(np.float32)
+    p1_angle = np.angle(p1).astype(np.float32)
+
+    diagnostic_vars = {}
+    if deramp_diagnostics:
+        def signed_k_psi(burst_idx: int) -> float:
+            steering_rate = annot.azimuth_steering_rate / (
+                1.0 - 1.0 / float(S1_AZIMUTH_PANELS ** 2)
+            )
+            psi_dot = steering_rate * np.pi / 180.0
+            return 2.0 * annot.radar_frequency / C_LIGHT * _orbital_speed(annot, burst_idx) * psi_dot
+
+        def merge_with_signed_steering() -> np.ndarray:
+            lpb = annot.lines_per_burst
+            n_rg = annot.samples_per_burst
+            ati = annot.azimuth_time_interval
+            inter_burst_lines = int(round(
+                (annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+                 ).total_seconds() / ati
+            ))
+            overlap_lines = lpb - inter_burst_lines
+            I_diag = np.zeros((annot.n_lines, n_rg), dtype=np.complex64)
+
+            for j, burst in enumerate(annot.bursts):
+                az0 = int(round(
+                    (burst.azimuth_time - annot.first_line_time).total_seconds() / ati
+                ))
+                raw = read_slc_burst(files['measurement'], annot, j)
+                k_a = _fm_rate_at_burst(annot, j)
+                k_psi = signed_k_psi(j)
+                k_s = -k_a * k_psi / (k_a - k_psi)
+                t_az = (
+                    np.arange(lpb, dtype=np.float64) - 0.5 * (lpb - 1)
+                ) * annot.azimuth_time_interval
+                chirp = np.exp(1j * np.pi * k_s[np.newaxis, :] * t_az[:, np.newaxis] ** 2)
+                deramped = (raw * chirp).astype(np.complex64)
+                apply_burst_valid_sample_mask(deramped, burst)
+
+                w = _burst_window(lpb, overlap_lines)
+                f = np.fft.fftfreq(lpb, d=1.0 / annot.prf)
+                C2 = np.exp(-1j * np.pi * f**2 / k_psi).astype(np.complex64)
+                I_defoc = np.fft.ifft(C2[:, None] * np.fft.fft(deramped, axis=0), axis=0)
+                I_windowed = (I_defoc * w[:, None]).astype(np.complex64)
+                I_cbdw = np.fft.ifft(C2.conj()[:, None] * np.fft.fft(I_windowed, axis=0), axis=0)
+                I_diag[az0:az0 + lpb, :] += I_cbdw.astype(np.complex64)
+            return I_diag
+
+        p0_s, p1_s, _, _ = estimate_correlation_grid(
+            merge_with_signed_steering(), block_az, block_rg, stride_az, stride_rg,
+        )
+        f_dc_s, _, _ = correlation_to_doppler(
+            p0_s, p1_s, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
+        )
+        diagnostic_vars['p1_angle_signed_steering'] = np.angle(p1_s).astype(np.float32)
+        diagnostic_vars['f_dc_signed_steering'] = f_dc_s.astype(np.float32)
+
     # Step III — subtract geometry Doppler.
     # With POEORB: use per-burst full POEORB geometry (no annotation polynomial visible).
     # Without:     use blended annotation polynomial.
@@ -1077,13 +1267,15 @@ def compute_rvl(
             for j in range(len(annot.bursts))
         ]))
     else:
-        f_geom_ann = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
-        f_dca      = f_dc - f_geom_ann
+        f_geom = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
+        f_dca      = f_dc - f_geom
         mispointing_source = 'none'
         mean_miss_hz = 0.0
 
     # Subtract sideband bias (constant over scene)
     f_dca = f_dca - f_sideband
+
+    f_dca_pre_descallop = f_dca.copy()
 
     v_r = (annot.wavelength / 2.0 * f_dca).astype(np.float32)
 
@@ -1105,21 +1297,72 @@ def compute_rvl(
     if poeorb_path:     corrections_applied.append('POEORB mispointing')
     if aap is not None: corrections_applied.append('varpi_delta, sideband_bias')
 
+    data_vars = {
+        'doppler_hz': xr.DataArray(
+            f_dca, dims=dims,
+            attrs={'long_name': 'Doppler centroid anomaly', 'units': 'Hz'},
+        ),
+        'radial_vel': xr.DataArray(
+            v_r, dims=dims,
+            attrs={'long_name': 'Radial velocity', 'units': 'm s-1'},
+        ),
+        'f_dc': xr.DataArray(
+            f_dc_raw, dims=dims,
+            attrs={
+                'long_name': 'Observed Doppler centroid from merged SLC before geometry subtraction',
+                'units': 'Hz',
+            },
+        ),
+        'f_dc_radar_prf': xr.DataArray(
+            f_dc_radar_prf, dims=dims,
+            attrs={
+                'long_name': 'Observed Doppler centroid rescaled from azimuthFrequency to radar PRF',
+                'units': 'Hz',
+            },
+        ),
+        'p1_angle': xr.DataArray(
+            p1_angle, dims=dims,
+            attrs={'long_name': 'Phase of first azimuth correlation coefficient', 'units': 'rad'},
+        ),
+        'f_geom': xr.DataArray(
+            f_geom, dims=dims,
+            attrs={'long_name': 'Geometry Doppler model', 'units': 'Hz'},
+        ),
+        'f_dca_pre_descallop': xr.DataArray(
+            f_dca_pre_descallop, dims=dims,
+            attrs={'long_name': 'Doppler anomaly before descallop', 'units': 'Hz'},
+        ),
+        'snr': xr.DataArray(
+            snr, dims=dims,
+            attrs={'long_name': 'Signal-to-noise ratio estimate'},
+        ),
+    }
+    if debug:
+        data_vars.update({
+            'f_dc_raw': xr.DataArray(
+                f_dc_raw, dims=dims,
+                attrs={'long_name': 'Alias of f_dc for older debug notebooks', 'units': 'Hz'},
+            ),
+        })
+    if deramp_diagnostics:
+        data_vars.update({
+            'p1_angle_signed_steering': xr.DataArray(
+                diagnostic_vars['p1_angle_signed_steering'], dims=dims,
+                attrs={
+                    'long_name': 'p1 phase using signed TOPS steering rate diagnostic',
+                    'units': 'rad',
+                },
+            ),
+            'f_dc_signed_steering': xr.DataArray(
+                diagnostic_vars['f_dc_signed_steering'], dims=dims,
+                attrs={
+                    'long_name': 'Observed Doppler using signed TOPS steering rate diagnostic',
+                    'units': 'Hz',
+                },
+            ),
+        })
     return xr.Dataset(
-        {
-            'doppler_hz': xr.DataArray(
-                f_dca, dims=dims,
-                attrs={'long_name': 'Doppler centroid anomaly', 'units': 'Hz'},
-            ),
-            'radial_vel': xr.DataArray(
-                v_r, dims=dims,
-                attrs={'long_name': 'Radial velocity', 'units': 'm s-1'},
-            ),
-            'snr': xr.DataArray(
-                snr, dims=dims,
-                attrs={'long_name': 'Signal-to-noise ratio estimate'},
-            ),
-        },
+        data_vars,
         coords={
             'latitude':        (dims, lat),
             'longitude':       (dims, lon),
@@ -1144,6 +1387,7 @@ def compute_rvl(
             'mispointing_hz':        mean_miss_hz,
             'gamma_ambiguity':       float(gamma_amb) if gamma_amb is not None else float('nan'),
             'sideband_bias_hz':      float(f_sideband),
+            'doppler_input':         'deramped, spectrally windowed, merged TOPS bursts',
         },
     )
 

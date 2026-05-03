@@ -253,3 +253,45 @@ def apply_poeorb(annot, eof_path: str, margin_s: float = 60.0):
     new_annot.orbit_positions  = [r[1] for r in filtered]
     new_annot.orbit_velocities = [r[2] for r in filtered]
     return new_annot
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUX_INS parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AuxInsParams:
+    """Key parameters from a Sentinel-1 AUX_INS file."""
+    reference_antenna_angle_deg: float  # nominal elevation off-nadir angle [deg]
+    reference_height_m:          float  # reference orbit height [m]
+    roll_steering_sensitivity:   float  # roll change per metre of height deviation [rad/m]
+    radar_frequency_hz:          float  # carrier frequency [Hz]
+
+
+def parse_aux_ins(aux_ins_path: str) -> AuxInsParams:
+    """
+    Parse a Sentinel-1 AUX_INS SAFE directory and return key instrument parameters.
+
+    Parameters
+    ----------
+    aux_ins_path : str
+        Path to the AUX_INS .SAFE directory (or its nested .SAFE sub-directory).
+
+    Returns
+    -------
+    AuxInsParams
+    """
+    import glob as _glob
+    xml_files = _glob.glob(
+        os.path.join(aux_ins_path, '**', 's1?-aux-ins.xml'), recursive=True
+    )
+    if not xml_files:
+        raise FileNotFoundError(f'No s1?-aux-ins.xml found under {aux_ins_path}')
+    root = ET.parse(xml_files[0]).getroot()
+    rsp = root.find('rollSteeringParams')
+    return AuxInsParams(
+        reference_antenna_angle_deg=float(rsp.findtext('referenceAntennaAngle')),
+        reference_height_m=float(rsp.findtext('referenceHeight')),
+        roll_steering_sensitivity=float(rsp.findtext('rollSteeringSensitivity')),
+        radar_frequency_hz=float(root.findtext('radarFrequency')),
+    )

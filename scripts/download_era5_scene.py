@@ -26,7 +26,7 @@ See: https://cds.climate.copernicus.eu/api-how-to
 
 import cdsapi
 
-OUT = 'data/era5_data/era5_scene_20260205.nc'
+OUT = 'data/era5_data/era5_scene_20260212.nc'
 
 c = cdsapi.Client()
 
@@ -47,10 +47,10 @@ c.retrieve(
         ],
         'year':  '2026',
         'month': '02',
-        'day':   '05',
+        'day':   '12',
         'time':  ['16:00', '17:00'],
         # CDS area format: [North, West, South, East]
-        'area':  [-33, 26, -36, 29],
+        'area':  [-30, 26, -36, 32],
         'format': 'netcdf',
     },
     OUT,

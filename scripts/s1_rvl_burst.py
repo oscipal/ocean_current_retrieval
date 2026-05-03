@@ -65,6 +65,7 @@ from scripts.s1_rvl import (
     _interpolate_orbit,
     compute_gamma_ambiguity,
     compute_sideband_bias,
+    apply_burst_valid_sample_mask,
 )
 
 
@@ -150,15 +151,15 @@ def compute_rvl_burst(
     raw      = read_slc_burst(files['measurement'], annot, burst_idx)
     deramped = deramp_burst(raw, annot, burst_idx)
 
-    # Zero lines that the annotation flags as invalid (ramp-up / ramp-down edges).
-    valid_lines = burst.first_valid_sample != -1
-    deramped[~valid_lines, :] = 0.0
+    # Zero samples outside the annotation's per-line valid range.
+    valid_mask = apply_burst_valid_sample_mask(deramped, burst)
 
     # ------------------------------------------------------------------
     # Step II — correlation coefficients with optional varpi_delta (eq. 9)
     # ------------------------------------------------------------------
     p0, p1, az_local, rg_centers = estimate_correlation_grid(
         deramped, block_az, block_rg, stride_az, stride_rg,
+        valid_mask=valid_mask,
     )
 
     # az_local is burst-local [0, linesPerBurst).

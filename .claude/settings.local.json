@@ -27,7 +27,18 @@
       "Bash(C:/Users/ottos/miniconda3/python.exe check_aux.py)",
       "Bash(C:/Users/ottos/miniconda3/envs/s1/python.exe check_aux.py)",
       "Bash(C:/Users/ottos/miniconda3/python.exe -c \"import sys; print\\(sys.executable\\)\")",
-      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe check_aux.py)"
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe check_aux.py)",
+      "Bash(python -c \"from scripts.rvl_pipeline import plot_pipeline_steps; print\\('import OK'\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import plot_pipeline_steps; print\\('import OK'\\)\")",
+      "Bash(conda env *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(python *)",
+      "Bash(ncdump -h \"C:\\\\Users\\\\ottos\\\\Documents\\\\Geomatik\\\\2. Sem\\\\ocean_current_retrieval\\\\data\\\\sentinel-1\\\\S1A_IW_OCN__2SDV_20260205T165251_20260205T165320_063086_07EAEF_420C.SAFE\\\\measurement\\\\s1a-iw-ocn-vv-20260205t165251-20260205t165322-063086-07EAEF-001.nc\")",
+      "PowerShell(python -c \"import sys; print\\('\\\\n'.join\\(sys.path\\)\\)\")",
+      "PowerShell(python \"/tmp/read_ocn.py\")",
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_all_bursts, _run_merged_pipeline; import inspect; print\\('run_all_bursts params:', list\\(inspect.signature\\(run_all_bursts\\).parameters.keys\\(\\)\\)\\); print\\('_run_merged_pipeline params:', list\\(inspect.signature\\(_run_merged_pipeline\\).parameters.keys\\(\\)\\)\\)\")",
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_pipeline, run_all_bursts, _run_merged_pipeline; import inspect; print\\('run_pipeline:', [p for p in inspect.signature\\(run_pipeline\\).parameters if 'ocn' in p or 'merge' in p or 'tops' in p]\\); print\\('run_all_bursts:', [p for p in inspect.signature\\(run_all_bursts\\).parameters if 'ocn' in p or 'merge' in p or 'tops' in p]\\); print\\('_run_merged_pipeline:', [p for p in inspect.signature\\(_run_merged_pipeline\\).parameters if 'ocn' in p or 'merge' in p]\\)\")",
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_all_bursts, _run_ocn_pipeline, _run_merged_pipeline; import inspect; print\\('_run_ocn_pipeline params:', list\\(inspect.signature\\(_run_ocn_pipeline\\).parameters.keys\\(\\)\\)\\)\")"
     ]
   }
 }
