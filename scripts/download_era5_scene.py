@@ -26,7 +26,7 @@ See: https://cds.climate.copernicus.eu/api-how-to
 
 import cdsapi
 
-OUT = 'data/era5_data/era5_scene_20260212.nc'
+OUT = 'data/era5_data/scene3/era5_wind.nc'
 
 c = cdsapi.Client()
 
@@ -37,20 +37,20 @@ c.retrieve(
         'variable': [
             '10m_u_component_of_wind',
             '10m_v_component_of_wind',
-            'u_component_stokes_drift',
-            'v_component_stokes_drift',
-            'significant_height_of_combined_wind_waves_and_swell',
-            'mean_wave_period',
-            'mean_wave_direction',
-            'mean_direction_of_wind_waves',
-            'significant_height_of_wind_waves',
+            # 'u_component_stokes_drift',
+            # 'v_component_stokes_drift',
+            # 'significant_height_of_combined_wind_waves_and_swell',
+            # 'mean_wave_period',
+            # 'mean_wave_direction',
+            # 'mean_direction_of_wind_waves',
+            # 'significant_height_of_wind_waves',
         ],
         'year':  '2026',
         'month': '02',
-        'day':   '12',
-        'time':  ['16:00', '17:00'],
+        'day':   '22',
+        'time':  ['17:00', '18:00'],
         # CDS area format: [North, West, South, East]
-        'area':  [-30, 26, -36, 32],
+        'area':  [-30, 23, -37, 32],
         'format': 'netcdf',
     },
     OUT,

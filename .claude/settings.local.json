@@ -38,7 +38,11 @@
       "PowerShell(python \"/tmp/read_ocn.py\")",
       "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_all_bursts, _run_merged_pipeline; import inspect; print\\('run_all_bursts params:', list\\(inspect.signature\\(run_all_bursts\\).parameters.keys\\(\\)\\)\\); print\\('_run_merged_pipeline params:', list\\(inspect.signature\\(_run_merged_pipeline\\).parameters.keys\\(\\)\\)\\)\")",
       "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_pipeline, run_all_bursts, _run_merged_pipeline; import inspect; print\\('run_pipeline:', [p for p in inspect.signature\\(run_pipeline\\).parameters if 'ocn' in p or 'merge' in p or 'tops' in p]\\); print\\('run_all_bursts:', [p for p in inspect.signature\\(run_all_bursts\\).parameters if 'ocn' in p or 'merge' in p or 'tops' in p]\\); print\\('_run_merged_pipeline:', [p for p in inspect.signature\\(_run_merged_pipeline\\).parameters if 'ocn' in p or 'merge' in p]\\)\")",
-      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_all_bursts, _run_ocn_pipeline, _run_merged_pipeline; import inspect; print\\('_run_ocn_pipeline params:', list\\(inspect.signature\\(_run_ocn_pipeline\\).parameters.keys\\(\\)\\)\\)\")"
+      "Bash(C:/Users/ottos/miniconda3/envs/ocean/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); from scripts.rvl_pipeline import run_all_bursts, _run_ocn_pipeline, _run_merged_pipeline; import inspect; print\\('_run_ocn_pipeline params:', list\\(inspect.signature\\(_run_ocn_pipeline\\).parameters.keys\\(\\)\\)\\)\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\ottos\\\\Documents\\\\Geomatik\\\\2. Sem\\\\ocean_current_retrieval\" -Recurse -File)",
+      "Bash(Select-Object FullName)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\ottos\\\\Documents\\\\Geomatik\\\\2. Sem\\\\ocean_current_retrieval\" -Recurse)",
+      "Bash(Select-Object -Property FullName)"
     ]
   }
 }

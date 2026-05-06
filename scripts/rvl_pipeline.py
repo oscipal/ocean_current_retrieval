@@ -44,6 +44,7 @@ from scripts.s1_rvl import (
     deramp_burst,
     merge_bursts,
     estimate_correlation_grid,
+    estimate_doppler_grid_fft,
     correlation_to_doppler,
     _fm_rate_at_burst,
     _steering_doppler_rate,
@@ -53,6 +54,7 @@ from scripts.s1_rvl import (
     _geom_doppler_annotation,
     _geom_doppler_poeorb,
     _blended_geom_doppler_annotation,
+    _blend_burst_profiles,
     _geolocate_grid,
     _interpolate_orbit,
     compute_mispointing_doppler,
@@ -136,6 +138,7 @@ def run_pipeline(
     stride_rg:    int = 256,
     tops_scaling: str = 'none',
     use_ocn_dc:   bool = False,
+    estimator:    str = 'cde',
 ) -> dict:
     """
     Run the full pipeline from the walkthrough notebook.
@@ -177,12 +180,24 @@ def run_pipeline(
     deramped = deramp_burst(raw, annot, burst_idx)
     valid_mask = apply_burst_valid_sample_mask(deramped, burst)
 
-    # ── Step II: Correlation coefficients ───────────────────────────────────
-    print('Step II: estimating p0, p1 …')
-    p0, p1, az_local, rg_centers = estimate_correlation_grid(
-        deramped, block_az, block_rg, stride_az, stride_rg,
-        valid_mask=valid_mask,
-    )
+    # ── Step II: Correlation / Doppler estimation ────────────────────────────
+    if estimator == 'fft':
+        print('Step II: estimating Doppler via FFT spectral centroid …')
+        f_dc, snr, az_local, rg_centers = estimate_doppler_grid_fft(
+            deramped, annot.prf, block_az, block_rg, stride_az, stride_rg,
+            valid_mask=valid_mask,
+        )
+        p0 = np.ones_like(f_dc, dtype=np.float32)
+        p1 = np.full_like(f_dc, np.nan, dtype=np.float32)
+    else:
+        print('Step II: estimating p0, p1 …')
+        p0, p1, az_local, rg_centers = estimate_correlation_grid(
+            deramped, block_az, block_rg, stride_az, stride_rg,
+            valid_mask=valid_mask,
+        )
+        f_dc, _, snr = correlation_to_doppler(
+            p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
+        )
 
     # Full-scene azimuth indices for geolocation
     ati      = annot.azimuth_time_interval
@@ -192,13 +207,9 @@ def run_pipeline(
     az_full = az_local + az0_full
 
     # ── Step III: Doppler centroid → DCA ────────────────────────────────────
-    print('Step III: Doppler centroid and geometry subtraction …')
+    print('Step III: geometry subtraction …')
     if tops_scaling not in ('none', 'multiply', 'divide'):
         raise ValueError("tops_scaling must be 'none', 'multiply', or 'divide'")
-
-    f_dc, _, snr = correlation_to_doppler(
-        p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
-    )
     k_a = _fm_rate_at_burst(annot, burst_idx)[rg_centers]
     k_psi = _steering_doppler_rate(annot, burst_idx)
     tops_scale = (1.0 + k_psi / k_a).astype(np.float32)
@@ -352,6 +363,7 @@ def run_all_bursts(
     tops_scaling: str = 'none',
     merge_first:  bool = False,
     use_ocn_dc:   bool = False,
+    estimator:    str = 'cde',
     **kwargs,
 ) -> list[dict]:
     """
@@ -392,7 +404,8 @@ def run_all_bursts(
             slc_safe=slc_safe, subswath=subswath,
             poeorb_path=poeorb_path, aux_cal_path=aux_cal_path,
             ocn_safe=ocn_safe, era5_wind=era5_wind, era5_wave=era5_wave,
-            glo12=glo12, polarisation=polarisation, use_ocn_dc=use_ocn_dc, **kwargs,
+            glo12=glo12, polarisation=polarisation, use_ocn_dc=use_ocn_dc,
+            estimator=estimator, **kwargs,
         )
 
     files = find_safe_files(slc_safe, subswath, polarisation)
@@ -411,7 +424,7 @@ def run_all_bursts(
             poeorb_path=poeorb_path, aux_cal_path=aux_cal_path,
             ocn_safe=ocn_safe, era5_wind=era5_wind, era5_wave=era5_wave,
             glo12=glo12, polarisation=polarisation, **kwargs,
-            tops_scaling=tops_scaling, use_ocn_dc=use_ocn_dc,
+            tops_scaling=tops_scaling, use_ocn_dc=use_ocn_dc, estimator=estimator,
         )
         results.append(r)
 
@@ -581,6 +594,7 @@ def _run_merged_pipeline(
     stride_az:    int = 128,
     stride_rg:    int = 256,
     use_ocn_dc:   bool = False,
+    estimator:    str = 'cde',
 ) -> list[dict]:
     """
     Merge all bursts first, then run the full pipeline on the continuous image.
@@ -603,39 +617,36 @@ def _run_merged_pipeline(
     print('Step I: merging bursts …')
     I_c = merge_bursts(annot, files['measurement'])
 
-    # Step II: correlation on the full merged image
-    print('Step II: estimating p0, p1 …')
-    p0, p1, az_centers, rg_centers = estimate_correlation_grid(
-        I_c, block_az, block_rg, stride_az, stride_rg,
-    )
+    # Step II: Doppler estimation on the full merged image
+    if estimator == 'fft':
+        print('Step II: estimating Doppler via FFT spectral centroid …')
+        f_dc, snr, az_centers, rg_centers = estimate_doppler_grid_fft(
+            I_c, annot.prf, block_az, block_rg, stride_az, stride_rg,
+        )
+        p0 = np.ones_like(f_dc, dtype=np.float32)
+        p1 = np.full_like(f_dc, np.nan, dtype=np.float32)
+    else:
+        print('Step II: estimating p0, p1 …')
+        p0, p1, az_centers, rg_centers = estimate_correlation_grid(
+            I_c, block_az, block_rg, stride_az, stride_rg,
+        )
+        f_dc, _, snr = correlation_to_doppler(
+            p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
+        )
 
-    # Step III: Doppler centroid
-    print('Step III: Doppler centroid and geometry subtraction …')
-    f_dc, _, snr = correlation_to_doppler(
-        p0, p1, annot.prf, annot.wavelength, gamma_amb=gamma_amb,
-    )
+    # Step III: Doppler centroid and geometry subtraction
+    print('Step III: geometry subtraction …')
 
     # Geometry subtraction — blended annotation polynomial over the full scene
     f_geom_ann = _blended_geom_doppler_annotation(annot, az_centers, rg_centers)
 
     if poeorb_path is not None:
-        # Nearest-burst POEORB differential, assigned per block row
-        ati = annot.azimuth_time_interval
-        az_burst_starts = [
-            int(round((b.azimuth_time - annot.first_line_time).total_seconds() / ati))
-            for b in annot.bursts
-        ]
-        lpb = annot.lines_per_burst
-        burst_f_geom_poe = [
-            _geom_doppler_poeorb(annot, annot_original, j, rg_centers).astype(np.float32)
+        burst_f_geom_poe_arr = np.stack([
+            _geom_doppler_poeorb(annot, annot_original, j, rg_centers).astype(np.float64)
             for j in range(len(annot.bursts))
-        ]
-        f_geom_poe = np.zeros((len(az_centers), len(rg_centers)), dtype=np.float32)
-        for i, az in enumerate(az_centers):
-            j_best = int(np.argmin([
-                abs(int(az) - (az0 + lpb // 2)) for az0 in az_burst_starts
-            ]))
-            f_geom_poe[i, :] = burst_f_geom_poe[j_best]
+        ], axis=0)
+        # Blend with partition-of-unity weights to avoid a step at burst boundaries
+        f_geom_poe = _blend_burst_profiles(annot, az_centers, burst_f_geom_poe_arr)
         f_geom = f_geom_poe
     else:
         f_geom_poe = f_geom_ann.copy()

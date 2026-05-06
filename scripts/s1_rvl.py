@@ -895,6 +895,124 @@ def estimate_correlation_grid(
     return p0_grid, p1_grid, az_centers, rg_centers
 
 
+def _block_fft_doppler(
+    block: np.ndarray,
+    prf: float,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[float, float]:
+    """
+    FFT spectral-centroid Doppler estimator for one block.
+
+    Computes f_dc = Σ f·P(f) / Σ P(f) where P is the range-averaged azimuth
+    power spectrum, with Hanning² weighting across range.  More robust than the
+    lag-1 CDE to point targets and to residual quadratic phase errors from
+    imperfect deramping (a symmetric chirp residual broadens the spectral peak
+    but does not shift the power-weighted centroid).
+
+    Returns
+    -------
+    f_dc  : float  Doppler centroid [Hz], NaN if insufficient power
+    snr   : float  spectral peak / noise-floor ratio (linear)
+    """
+    n_az, n_rg = block.shape
+    haz = np.hanning(n_az).astype(np.float32)
+    hra = np.hanning(n_rg).astype(np.float32)
+
+    if valid_mask is not None:
+        block = np.where(valid_mask, block, 0.0)
+
+    I_w = block * haz[:, None]
+
+    S   = np.fft.fft(I_w, axis=0)          # (n_az, n_rg)
+    P   = np.abs(S) ** 2                    # azimuth power spectrum per range col
+
+    w2    = hra ** 2
+    denom = float(np.sum(w2))
+    if denom < 1e-30:
+        return float('nan'), float('nan')
+
+    P_avg = np.sum(P * w2[np.newaxis, :], axis=1) / denom   # (n_az,)
+
+    total = float(np.sum(P_avg))
+    if total < 1e-30:
+        return float('nan'), float('nan')
+
+    freqs = np.fft.fftfreq(n_az, d=1.0 / prf)   # Hz, 0-centred ordering
+    f_dc  = float(np.sum(freqs * P_avg) / total)
+
+    n_noise   = max(1, n_az // 4)
+    noise     = float(np.mean(np.sort(P_avg)[:n_noise]))
+    snr_val   = float((P_avg.max() - noise) / noise) if noise > 0 else 0.0
+
+    return f_dc, snr_val
+
+
+def estimate_doppler_grid_fft(
+    I_c: np.ndarray,
+    prf: float,
+    block_az: int = 256,
+    block_rg: int = 512,
+    stride_az: int = 128,
+    stride_rg: int = 256,
+    min_valid_fraction: float = 0.8,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Slide an estimation window over the image and compute Doppler centroid
+    via FFT spectral centroid (alternative to estimate_correlation_grid +
+    correlation_to_doppler).
+
+    Returns the same (f_dc, snr, az_centers, rg_centers) signature as the
+    CDE path for drop-in substitution in run_pipeline / compute_rvl.
+
+    Parameters
+    ----------
+    I_c                 : complex64, shape (n_az, n_rg)
+    prf                 : float [Hz]
+    block_az, block_rg  : estimation block dimensions [samples]
+    stride_az, stride_rg: block stride [samples]
+    min_valid_fraction  : skip blocks with too many invalid pixels
+    valid_mask          : optional boolean mask, same shape as I_c
+
+    Returns
+    -------
+    f_dc       : float32, shape (n_out_az, n_out_rg)  [Hz]
+    snr        : float32, shape (n_out_az, n_out_rg)
+    az_centers : int array
+    rg_centers : int array
+    """
+    n_az, n_rg = I_c.shape
+    az_starts  = np.arange(0, n_az - block_az + 1, stride_az)
+    rg_starts  = np.arange(0, n_rg - block_rg + 1, stride_rg)
+    n_out_az   = len(az_starts)
+    n_out_rg   = len(rg_starts)
+
+    f_dc_grid = np.full((n_out_az, n_out_rg), np.nan, dtype=np.float32)
+    snr_grid  = np.full((n_out_az, n_out_rg), np.nan, dtype=np.float32)
+
+    for i, az0 in enumerate(az_starts):
+        for j, rg0 in enumerate(rg_starts):
+            block      = I_c[az0: az0 + block_az, rg0: rg0 + block_rg]
+            mask_block = None if valid_mask is None else valid_mask[
+                az0: az0 + block_az, rg0: rg0 + block_rg
+            ]
+            valid_frac = (
+                np.count_nonzero(block) / block.size
+                if mask_block is None
+                else np.count_nonzero(mask_block) / mask_block.size
+            )
+            if valid_frac < min_valid_fraction:
+                continue
+            f_dc_val, snr_val  = _block_fft_doppler(block, prf, mask_block)
+            f_dc_grid[i, j]    = f_dc_val
+            snr_grid[i, j]     = snr_val
+
+    az_centers = az_starts + block_az // 2
+    rg_centers = rg_starts + block_rg // 2
+
+    return f_dc_grid, snr_grid, az_centers, rg_centers
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step III — Parameter estimation  (Section 5.7)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1244,26 +1362,23 @@ def compute_rvl(
     ]
     if poeorb_path is not None:
         # Compute full POEORB-based geometry per burst (range-dependent)
-        burst_f_geom_poe = [
-            _geom_doppler_poeorb(annot, annot_original, j, rg_centers).astype(np.float32)
+        burst_f_geom_poe_list = [
+            _geom_doppler_poeorb(annot, annot_original, j, rg_centers).astype(np.float64)
             for j in range(len(annot.bursts))
         ]
         burst_f_geom_ann = [
             _geom_doppler_annotation(annot_original, j, rg_centers).astype(np.float32)
             for j in range(len(annot.bursts))
         ]
-        # Build per-block geometry grid from nearest burst
-        f_geom = np.zeros_like(f_dc, dtype=np.float32)
-        lpb = annot.lines_per_burst
-        for i, az in enumerate(az_centers):
-            j_best = int(np.argmin([
-                abs(int(az) - (az0 + lpb // 2)) for az0 in az_burst_starts
-            ]))
-            f_geom[i, :] = burst_f_geom_poe[j_best]
+        # Blend POEORB geometry with the same partition-of-unity weights as the
+        # SLC merge; this eliminates the step discontinuity at burst boundaries
+        # that a nearest-burst assignment would produce.
+        burst_f_geom_poe_arr = np.stack(burst_f_geom_poe_list, axis=0)
+        f_geom = _blend_burst_profiles(annot, az_centers, burst_f_geom_poe_arr)
         f_dca = f_dc - f_geom
         mispointing_source = 'poeorb'
         mean_miss_hz = float(np.mean([
-            np.mean(np.abs(burst_f_geom_poe[j] - burst_f_geom_ann[j]))
+            np.mean(np.abs(burst_f_geom_poe_list[j] - burst_f_geom_ann[j]))
             for j in range(len(annot.bursts))
         ]))
     else:
@@ -1479,6 +1594,58 @@ def _blended_geom_doppler_annotation(
             f_geom[i] = (blend / w2_sum).astype(np.float32)
 
     return f_geom
+
+
+def _blend_burst_profiles(
+    annot: 'S1Annotation',
+    az_centers: np.ndarray,
+    f_per_burst: np.ndarray,
+) -> np.ndarray:
+    """
+    Blend per-burst range profiles (n_bursts, n_rg) onto the estimation grid
+    using the same partition-of-unity w² weights as _window_burst / _blended_geom_doppler_annotation.
+
+    Use this whenever a per-burst quantity (POEORB geometry, mispointing, …)
+    must be interpolated across burst boundaries consistently with the SLC merge.
+
+    Parameters
+    ----------
+    annot       : S1Annotation
+    az_centers  : (n_out_az,) int  azimuth pixel centres in the merged image
+    f_per_burst : (n_bursts, n_rg) float64  one range profile per burst
+
+    Returns
+    -------
+    float32, shape (n_out_az, n_rg)
+    """
+    lpb = annot.lines_per_burst
+    ati = annot.azimuth_time_interval
+    inter_burst_lines = int(round(
+        (annot.bursts[1].azimuth_time - annot.bursts[0].azimuth_time
+         ).total_seconds() / ati
+    ))
+    overlap_lines = lpb - inter_burst_lines
+    az_offsets = [
+        int(round((b.azimuth_time - annot.first_line_time).total_seconds() / ati))
+        for b in annot.bursts
+    ]
+    win = _burst_window(lpb, overlap_lines).astype(np.float64)
+    n_rg = f_per_burst.shape[1]
+    out  = np.zeros((len(az_centers), n_rg), dtype=np.float32)
+
+    for i, az in enumerate(az_centers):
+        blend  = np.zeros(n_rg, dtype=np.float64)
+        w2_sum = 0.0
+        for j, az0 in enumerate(az_offsets):
+            rel = int(az) - az0
+            if 0 <= rel < lpb:
+                w2      = float(win[rel]) ** 2
+                blend  += w2 * f_per_burst[j]
+                w2_sum += w2
+        if w2_sum > 0:
+            out[i] = (blend / w2_sum).astype(np.float32)
+
+    return out
 
 
 def _geom_doppler_at_pixels(par_path: str, rg_centers: np.ndarray) -> np.ndarray:
