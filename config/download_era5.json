@@ -1,0 +1,16 @@
+{
+  "download_dir": "data/era5_data/scene3",
+  "year": 2026,
+  "month": 2,
+  "day": 22,
+  "time": [
+    "17:00",
+    "18:00"
+  ],
+  "area": [
+    -30,
+    23,
+    -37,
+    32
+  ]
+}

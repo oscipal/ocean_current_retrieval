@@ -1,97 +1,118 @@
-# Ocean Current Retrieval from SAR Doppler Centroid Anomalies
+# Ocean Current Retrieval from Sentinel-1 RVL
 
-Retrieval of ocean surface current radial velocities from spaceborne SAR imagery using the Doppler Centroid Anomaly (DCA) method. The measured Doppler centroid of a SAR scene contains contributions from satellite geometry, instrument biases, surface waves and ocean currents. By subtracting all known contributions the residual gives the radial surface current velocity.
+This repository processes Sentinel-1 IW SLC data to estimate ocean surface radial velocity from Doppler centroid anomalies. The active code path is centered on Sentinel-1. Older BIOMASS-related utilities are still present, but they are not the main pipeline.
 
-The main focus is Sentinel-1 IW TOPS data in C-band. Some earlier exploratory work on BIOMASS P-band data is also in the repo.
+## Sentinel-1 Processing Model
 
----
+The retrieval is built around the Sentinel-1 RVL chain:
 
-## Method Overview
+1. Read Sentinel-1 SAFE annotation and burst SLC data.
+2. Deramp the TOPS burst.
+3. Estimate azimuth correlation or Doppler per block.
+4. Convert Doppler to Doppler centroid anomaly by subtracting geometry and sideband terms.
+5. Convert the anomaly to radial velocity.
+6. Geolocate the result.
+7. Apply optional metocean corrections and comparisons:
+   ERA5 Stokes drift, ERA5 wave Doppler bias, OCN mispointing, and GLO12 current comparison.
 
-```
-Observed DC  =  Geometry DC  +  Instrument bias  +  Wave DC  +  Mispointing  +  Current DC
-```
+There are two main processing modes:
 
-1. Read the SLC burst and deramp the TOPS chirp
-2. Estimate lag-0/lag-1 azimuth correlation coefficients (p0, p1) per block
-3. Convert p1 to Doppler centroid; apply AUX_CAL ambiguity and sideband corrections
-4. Subtract geometry Doppler computed from POEORB precision orbit
-5. Subtract ERA5 Stokes drift and wave Doppler bias
-6. Apply OCN rvlDcMiss mispointing correction
-7. Convert residual DCA to radial velocity: v_r = DCA * lambda / 2
+- `scripts/sentinel_1/pipeline.py`: the main operational Sentinel-1 workflow, including merged-burst processing and corrected radial-current outputs.
+- `scripts/sentinel_1/burst_pipeline.py`: a single-burst diagnostic path used to inspect burst-level behavior without the merged workflow.
 
-The full pipeline with plots and explanations is in `notebooks/rvl_pipeline_walkthrough.ipynb`.
+## Main Scripts
 
----
+### Core Sentinel-1 package
 
-## Repository Structure
+- [`scripts/sentinel_1/pipeline.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/pipeline.py:1)
+  Main Sentinel-1 RVL pipeline. This is the primary entry point for burst-wise and merged-burst retrievals, current corrections, and model comparison products.
 
-```
-notebooks/
-  rvl_pipeline_walkthrough.ipynb  # Main step-by-step Sentinel-1 RVL pipeline
-  s1_ocean.ipynb                  # Ocean scene processing
-  s1_ocn_burst.ipynb              # Burst-level OCN product exploration
-  s1_ocn_gamma.ipynb              # Ambiguity ratio investigation
-  s1_ocn_safe.ipynb               # OCN SAFE product reader/inspection
-  desert_DCA.ipynb                # DC estimation from BIOMASS desert scenes
-  desert_DCA_new.ipynb            # Updated desert DCA workflow
-  DCA_predictions.ipynb           # Predicted DCA from reference current data
-  DCA_approximation.ipynb         # DC measurement and geometry correction
-  s1_desert.ipynb                 # Sentinel-1 burst-level DC estimation
-  nisar.ipynb                     # NISAR exploratory work
+- [`scripts/sentinel_1/rvl.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/rvl.py:1)
+  Core RVL algorithms: deramping, burst merging, correlation estimation, Doppler conversion, geometry subtraction, descalloping, and geolocation.
 
-scripts/
-  s1_io.py                        # Sentinel-1 SAFE discovery and annotation parsing
-  s1_rvl.py                       # Core RVL retrieval (deramp, correlation, Doppler)
-  s1_rvl_burst.py                 # Burst-level RVL helpers
-  s1_aux.py                       # AUX_CAL and POEORB parsing and application
-  s1_ocn.py                       # OCN-style products derived from SLC inputs
-  s1_ocn_product.py               # Level-2 OCN SAFE reader (returns xarray datasets)
-  rvl_current.py                  # Ocean current extraction (Stokes, wave bias, GLO12)
-  compare_to_ocn.py               # Comparison between SLC-derived and OCN RVL
-  download_era5_scene.py          # ERA5 wind and wave data download for a scene
-  doppler.py                      # Generic Doppler estimation utilities
-  ocean_currents.py               # Copernicus Marine NetCDF loading and GeoTIFF export
-  io.py                           # Generic SLC file I/O
-  plotting.py                     # Visualisation helpers
-  corrections/
-    geometry.py                   # Geometry Doppler and POEORB correction
-    bias.py                       # Instrument bias corrections
-    ionosphere.py                 # Ionospheric correction utilities
+- [`scripts/sentinel_1/burst_pipeline.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/burst_pipeline.py:1)
+  Single-burst Sentinel-1 RVL workflow. Useful for debugging burst-specific failures before any burst merge or mosaic step.
 
-plots/                            # Output figures
-papers/                           # Reference algorithm documents and papers
-shell_commands/
-  burst_extraction.sh             # Burst extraction helper
-```
+- [`scripts/sentinel_1/safe_io.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/safe_io.py:1)
+  Sentinel-1 SAFE discovery, annotation parsing, burst reading, and calibration/noise LUT access.
 
----
+- [`scripts/sentinel_1/aux_files.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/aux_files.py:1)
+  Sentinel-1 auxiliary product parsers for AUX_CAL, AUX_INS, and orbit files such as POEORB.
+
+- [`scripts/sentinel_1/ocn_product.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/ocn_product.py:1)
+  Reader for Sentinel-1 Level-2 OCN SAFE products.
+
+- [`scripts/sentinel_1/ocn_analysis.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/ocn_analysis.py:1)
+  Analysis utilities built on top of OCN RVL and OWI fields, including radial-current and mispointing-related helpers.
+
+- [`scripts/sentinel_1/metocean.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/metocean.py:1)
+  Loads and interpolates ERA5, OCN, and GLO12 fields onto the SAR grid and look direction.
+
+- [`scripts/sentinel_1/grid_merge.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/grid_merge.py:1)
+  Merges burst-level outputs onto regular grids for scene-scale comparisons.
+
+- [`scripts/sentinel_1/plots.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/plots.py:1)
+  Plotting helpers for merged Sentinel-1 retrievals and model comparisons.
+
+### Diagnostics
+
+These scripts are for investigation and validation, not the core production path.
+
+- [`scripts/diagnostics/pipeline_diagnostics.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/pipeline_diagnostics.py:1)
+  Intermediate RVL diagnostics such as Doppler-centroid plots, pipeline-step plots, and mispointing checks.
+
+- [`scripts/diagnostics/current_comparison.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/current_comparison.py:1)
+  Burst-level comparison between the SLC-derived RVL result, OCN products, ERA5 corrections, and GLO12.
+
+- [`scripts/diagnostics/burst_fdc_offsets.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/burst_fdc_offsets.py:1)
+  Compares burst-wise `f_dc` behavior under different deramp and PRF conventions.
+
+- [`scripts/diagnostics/tops_scaling.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/tops_scaling.py:1)
+  Tests alternative TOPS scaling assumptions for Doppler retrieval.
+
+- [`scripts/diagnostics/era5_influence.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/era5_influence.py:1)
+  Visualizes the spatial influence of ERA5-based wind and wave corrections.
+
+- [`scripts/diagnostics/aux_cal_check.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/aux_cal_check.py:1)
+  Quick AUX_CAL sanity check for ambiguity ratio and sideband-bias terms.
+
+- [`scripts/diagnostics/attitude_inspection.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/attitude_inspection.py:1)
+  One-off diagnostic for Sentinel-1 attitude quaternion conventions used in mispointing analysis.
+
+### Shared / legacy utilities
+
+- [`scripts/download_era5.py`](/home/oscipal/ocean_current_retrieval/scripts/download_era5.py:1)
+  Downloads ERA5 wind and wave data from a JSON config file.
+
+- [`scripts/gamma_io.py`](/home/oscipal/ocean_current_retrieval/scripts/gamma_io.py:1)
+  Shared readers for GAMMA-format SLC products and related metadata. Still used by some legacy and BIOMASS-oriented code paths.
+
+## Configuration and Inputs
+
+- [`config/download_era5.json`](/home/oscipal/ocean_current_retrieval/config/download_era5.json:1)
+  Default configuration for ERA5 downloads.
+
+Typical Sentinel-1 processing requires:
+
+- Sentinel-1 IW SLC SAFE
+- POEORB orbit file
+- AUX_CAL file
+- optional OCN SAFE
+- optional ERA5 wind and wave NetCDF files
+- optional GLO12 ocean current NetCDF file
 
 ## Data Sources
 
-| Data | Product | Resolution |
-|------|---------|------------|
-| Sentinel-1 SLC | ESA Copernicus Open Access Hub | IW ~20 x 5 m |
-| Sentinel-1 OCN | ESA Copernicus Open Access Hub | ~1 km |
-| AUX_CAL / POEORB | ESA auxiliary file server | |
-| Ocean currents | [CMEMS GLO12 GLOBAL_ANALYSISFORECAST_PHY_001_024](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_PHY_001_024/description) | 1/12° |
-| ERA5 wind and waves | [Copernicus Climate Data Store](https://cds.climate.copernicus.eu) | ~31 km |
-| BIOMASS L1a SLC | [ESA MAAP Explorer](https://explorer.maap.eo.esa.int/?q=BiomassLevel1a) | |
-
----
+- Sentinel-1 SLC and OCN products: ESA Copernicus
+- POEORB / AUX files: ESA Sentinel-1 auxiliary products
+- ERA5 wind and waves: Copernicus Climate Data Store
+- GLO12 ocean currents: Copernicus Marine Service
 
 ## Setup
 
-Clone the repository:
-
 ```bash
 git clone git@github.com:oscipal/ocean_current_retrieval.git
-cd ocean_current_retrieval/
-```
-
-Create a conda environment with all dependencies:
-
-```bash
+cd ocean_current_retrieval
 conda create --name ocr --file requirements.txt
 conda activate ocr
 ```
