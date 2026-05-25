@@ -1,5 +1,7 @@
 """Implement the core Sentinel-1 RVL algorithm from deramping to geolocation."""
 
+from datetime import timedelta
+
 import numpy as np
 import xarray as xr
 from scipy.interpolate import RectBivariateSpline
@@ -15,6 +17,7 @@ from .safe_io import (
 from ..gamma_io import parse_slc_par, read_slc
 
 C_LIGHT = 299_792_458.0    # m/s
+S1_AZIMUTH_PANELS = 12     # Sentinel-1 number of azimuth antenna panels (hardware constant)
 
 
 def burst_valid_sample_mask(burst, n_samples: int) -> np.ndarray:
@@ -501,8 +504,8 @@ def _fm_rate_at_burst(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     -------
     np.ndarray, shape (n_samples,)
     """
-    burst = annot.bursts[burst_idx]
-    afr   = _nearest_estimate(annot.azimuth_fm_rates, burst.azimuth_time)
+    burst_mid = _burst_mid_time(annot, burst_idx)
+    afr   = _nearest_estimate(annot.azimuth_fm_rates, burst_mid)
     tau   = slant_range_time_vector(annot)          # (n_samples,)
     dt    = tau - afr.t0
     return sum(c * dt**k for k, c in enumerate(afr.poly))  # Hz/s
@@ -550,12 +553,6 @@ def _deramp_rate(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     """
     Per-range-sample deramp chirp rate k_s(τ) [Hz/s].
 
-    From Miranda (2017) TOPS SLC deramping definition (eq. 2 in the RVL doc):
-
-        k_s = −k_a · k_psi / (k_a − k_psi)
-
-    k_a < 0, k_psi > 0  →  k_s < 0  (downchirp removes the TOPS upswing).
-
     Returns
     -------
     np.ndarray, shape (n_samples,)
@@ -565,11 +562,79 @@ def _deramp_rate(annot: S1Annotation, burst_idx: int) -> np.ndarray:
     return -k_a * k_psi / (k_a - k_psi)                   # < 0, varies with range
 
 
+def _eval_poly(poly: np.ndarray, t0: float, tau: np.ndarray) -> np.ndarray:
+    """Evaluate polynomial coefficients on the slant-range time axis."""
+    dt = tau - t0
+    return sum(c * dt**k for k, c in enumerate(poly))
+
+
+def _burst_mid_time(annot: S1Annotation, burst_idx: int):
+    """Return the mid-burst azimuth time for burst-dependent parameter lookup."""
+    burst = annot.bursts[burst_idx]
+    half_dt = 0.5 * (annot.lines_per_burst - 1) * annot.azimuth_time_interval
+    return burst.azimuth_time + timedelta(seconds=half_dt)
+
+
+def _interpolate_velocity(annot: S1Annotation, t) -> np.ndarray:
+    """Linearly interpolate the orbit velocity to time *t*."""
+    t0 = annot.orbit_times[0]
+    times = np.array([(ot - t0).total_seconds() for ot in annot.orbit_times], dtype=np.float64)
+    ts = (t - t0).total_seconds()
+    return np.array(
+        [np.interp(ts, times, [v[i] for v in annot.orbit_velocities]) for i in range(3)],
+        dtype=np.float64,
+    )
+
+
+def _deramp_esa(burst: np.ndarray, annot: S1Annotation, burst_idx: int, demodulate: bool) -> np.ndarray:
+    """
+    ESA TOPS deramp phase from COPE-GSEG-EOPG-TN-14-0025 Eq. 1,
+    with optional Eq. 8 demodulation.
+
+    This applies:
+        Eq. 1: phi(eta, tau) = exp(-j*pi*kt(tau)*(eta-eta_ref(tau))^2)
+        Eq. 8: phi(eta, tau) *= exp(-j*2*pi*f_dc(tau)*(eta-eta_ref(tau)))
+    using the closest azimuth FM-rate and data DC polynomials to the burst mid
+    time, as recommended by the ESA note.
+    """
+    burst_mid = _burst_mid_time(annot, burst_idx)
+    tau = slant_range_time_vector(annot).astype(np.float64)
+    eta = (
+        np.arange(annot.lines_per_burst, dtype=np.float64) - 0.5 * (annot.lines_per_burst - 1)
+    )[:, np.newaxis] * annot.azimuth_time_interval
+
+    afr = _nearest_estimate(annot.azimuth_fm_rates, burst_mid)
+    dc = _nearest_estimate(annot.dc_estimates, burst_mid)
+
+    k_a = _eval_poly(afr.poly, afr.t0, tau).astype(np.float64)
+    f_dc = _eval_poly(dc.data_poly, dc.t0, tau).astype(np.float64)
+
+    vel = _interpolate_velocity(annot, burst_mid)
+    v_s = float(np.linalg.norm(vel))
+    k_psi = annot.azimuth_steering_rate * np.pi / 180.0
+    k_s = (2.0 * v_s / C_LIGHT) * annot.radar_frequency * k_psi
+    k_t = (k_a * k_s) / (k_a - k_s)
+
+    eta_c = -f_dc / k_a
+    eta_ref = eta_c - eta_c[annot.n_samples // 2]
+
+    phase = -np.pi * k_t[np.newaxis, :] * (eta - eta_ref[np.newaxis, :]) ** 2
+    if demodulate:
+        phase = phase - 2.0 * np.pi * f_dc[np.newaxis, :] * (eta - eta_ref[np.newaxis, :])
+    phi = np.exp(1j * phase)
+    return (burst * phi).astype(np.complex64)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step I — Deramp + window + merge  (Section 5.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def deramp_burst(burst: np.ndarray, annot: S1Annotation, burst_idx: int) -> np.ndarray:
+def deramp_burst(
+    burst: np.ndarray,
+    annot: S1Annotation,
+    burst_idx: int,
+    deramp_method: str = 'current',
+) -> np.ndarray:
     """
     Apply the TOPS deramp chirp to one complex burst (eq. 1–3 in the doc).
 
@@ -583,11 +648,19 @@ def deramp_burst(burst: np.ndarray, annot: S1Annotation, burst_idx: int) -> np.n
     burst     : complex64, shape (linesPerBurst, samplesPerBurst)
     annot     : S1Annotation
     burst_idx : int
+    deramp_method : str
+        `current` uses the existing repository deramp chirp.
+        `esa_eq1` uses the ESA TOPS deramp formula from Eq. 1.
 
     Returns
     -------
     complex64, same shape
     """
+    if deramp_method == 'esa_eq1':
+        return _deramp_esa(burst, annot, burst_idx, demodulate=False)
+    if deramp_method != 'current':
+        raise ValueError("deramp_method must be 'current' or 'esa_eq1'")
+
     lpb = annot.lines_per_burst
     k_s = _deramp_rate(annot, burst_idx)                               # (n_samples,)
     # Centre the discrete azimuth-time axis on the middle sample pair, not on
@@ -671,7 +744,11 @@ def _window_burst(
     return I_cbdw.astype(np.complex64)
 
 
-def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
+def merge_bursts(
+    annot: S1Annotation,
+    measurement_path: str,
+    deramp_method: str = 'current',
+) -> np.ndarray:
     """
     Read, deramp, window and coherently merge all TOPS bursts (Section 5.4.1,
     eq. 1–6).
@@ -704,7 +781,7 @@ def merge_bursts(annot: S1Annotation, measurement_path: str) -> np.ndarray:
         az1 = az0 + lpb
 
         raw      = read_slc_burst(measurement_path, annot, j)
-        deramped = deramp_burst(raw, annot, j)
+        deramped = deramp_burst(raw, annot, j, deramp_method=deramp_method)
 
         # Zero samples outside the per-line valid range before windowing; these
         # filled edge samples must not contribute to the overlap blend.

@@ -163,6 +163,69 @@ def write_burst_kml(
         f.write("\n".join(lines))
 
 
+def smooth_block_grid(
+    result: dict,
+    smooth_az: int = 1,
+    smooth_rg: int = 1,
+    fields: "list[str] | None" = None,
+) -> dict:
+    """NaN-aware boxcar smoothing of a pipeline result's 2D data fields.
+
+    Smoothing happens in (az_block, rg_block) index space, *before* any
+    lat/lon regridding.  Position / geometry fields (lat, lon, inc,
+    look_az_rad, …) and scalar metadata are not touched.  Use this to suppress
+    burst-boundary stepping in the merged map without attenuating per-burst
+    amplitudes the way the 'blend' demod-back does.
+
+    Parameters
+    ----------
+    result : dict
+        Result dict from :func:`run_pipeline`, :func:`run_gamma_dop2d_pipeline`,
+        or :func:`run_gamma_pipeline_from_safe`.
+    smooth_az, smooth_rg : int
+        Boxcar window in azimuth-block / range-block units.  Use 1 to disable
+        smoothing in that axis.
+    fields : list of str or None
+        Which keys to smooth.  Default covers ``v_*``, ``f_*``, ``snr``,
+        ``p0``, ``p1``.
+
+    Returns
+    -------
+    dict
+        Shallow copy of ``result`` with the smoothed fields replaced.
+    """
+    if smooth_az <= 1 and smooth_rg <= 1:
+        return result
+    if fields is None:
+        fields = [
+            "v_r", "v_stokes", "v_wave", "v_miss_ocn",
+            "v_current", "v_current_ocn", "v_model",
+            "f_dc", "f_dca", "f_dca_pre_descallop",
+            "f_dc_ocn", "f_geom_poe", "f_geom_ann", "f_miss_ocn",
+            "snr", "p0", "p1",
+        ]
+    from scipy.ndimage import uniform_filter
+
+    size = (max(1, int(smooth_az)), max(1, int(smooth_rg)))
+    out = dict(result)
+    for key in fields:
+        arr = out.get(key)
+        if arr is None:
+            continue
+        a = np.asarray(arr, dtype=np.float64)
+        if a.ndim != 2:
+            continue
+        mask = np.isfinite(a)
+        if not mask.any():
+            continue
+        filled = np.where(mask, a, 0.0)
+        num = uniform_filter(filled, size=size, mode="reflect")
+        den = uniform_filter(mask.astype(np.float64), size=size, mode="reflect")
+        smooth = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+        out[key] = smooth.astype(np.float32)
+    return out
+
+
 def compute_stats(sar: np.ndarray, model: np.ndarray) -> tuple[float, float, float]:
     """Return bias, RMSE, and correlation for finite overlapping cells."""
     mask = np.isfinite(sar) & np.isfinite(model)

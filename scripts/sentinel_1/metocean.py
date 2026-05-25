@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
@@ -35,9 +37,15 @@ def _select_time(ds: xr.Dataset, acq_time: str, time_dim: str = "valid_time"):
     return ds.isel({time_dim: tidx})
 
 
+@lru_cache(maxsize=8)
+def _open_dataset_cached(path: str) -> xr.Dataset:
+    """Reuse opened metocean datasets across per-burst processing."""
+    return xr.open_dataset(path)
+
+
 def load_era5_wind(path: str, acq_time: str) -> dict:
     """Load ERA5 10-m wind (u10, v10) at the hour closest to *acq_time*."""
-    ds = _select_time(xr.open_dataset(path), acq_time)
+    ds = _select_time(_open_dataset_cached(path), acq_time)
     lat = ds["latitude"].values.astype(np.float64)
     lon = ds["longitude"].values.astype(np.float64)
     if lat[0] > lat[-1]:
@@ -52,7 +60,7 @@ def load_era5_wind(path: str, acq_time: str) -> dict:
 
 def load_era5_wave(path: str, acq_time: str) -> dict:
     """Load ERA5 surface Stokes drift (ust, vst) and wave params at *acq_time*."""
-    ds = _select_time(xr.open_dataset(path), acq_time)
+    ds = _select_time(_open_dataset_cached(path), acq_time)
     lat = ds["latitude"].values.astype(np.float64)
     lon = ds["longitude"].values.astype(np.float64)
     flip = lat[0] > lat[-1]
@@ -109,6 +117,44 @@ def compute_wave_doppler_bias(
     return (scale * wind_speed * np.cos(delta_phi)).astype(np.float32)
 
 
+def load_ocn_wave_velocity(ocn_safe: str, subswath: str, polarisation: str) -> dict:
+    """Load OCN owiRadVel (wind-induced radial velocity) for one subswath.
+
+    Returns a dict with ``lat``, ``lon``, ``rad_vel`` (m/s) — the OCN's
+    calibrated wave-Doppler velocity, suitable as a drop-in replacement for
+    :func:`compute_wave_doppler_bias`.
+    """
+    ocn = load_ocn_safe(ocn_safe, swath=subswath, polarisation=polarisation)
+    ds = ocn["owi"]
+    sw = _SWATH_IDX[subswath.lower()]
+    if "owiSwath" in ds.dims:
+        ds = ds.isel(owiSwath=sw)
+    if "owiPolarisation" in ds.dims:
+        ds = ds.isel(owiPolarisation=0)
+
+    def _clean(name):
+        arr = ds[name].values.astype(np.float64)
+        arr[arr == _OCN_FILL] = np.nan
+        return arr
+
+    return {
+        "lat":     _clean("owiLat"),
+        "lon":     _clean("owiLon"),
+        "rad_vel": _clean("owiRadVel"),
+    }
+
+
+def compute_wave_doppler_bias_ocn(
+    owi: dict,
+    our_lat: np.ndarray,
+    our_lon: np.ndarray,
+) -> np.ndarray:
+    """Resample OCN ``owiRadVel`` onto the SAR retrieval grid."""
+    return match_to_sar_grid(
+        our_lat, our_lon, owi["lat"], owi["lon"], owi["rad_vel"],
+    ).astype(np.float32)
+
+
 def load_ocn_rvl(ocn_safe: str, subswath: str, polarisation: str) -> dict:
     """Load OCN RVL fields for one subswath, fill -> NaN."""
     ocn = load_ocn_safe(ocn_safe, swath=subswath, polarisation=polarisation)
@@ -157,7 +203,7 @@ def load_glo12_current(path: str, acq_time: str) -> dict:
     """Load glo12 surface uo/vo at the hour closest to *acq_time*."""
     import pandas as pd
 
-    ds = xr.open_dataset(path).isel(depth=0)
+    ds = _open_dataset_cached(path).isel(depth=0)
     target = np.datetime64(pd.Timestamp(acq_time).tz_localize(None))
     times = ds["time"].values.astype("datetime64[ns]")
     tidx = int(np.argmin(np.abs(times - target)))

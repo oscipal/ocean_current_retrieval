@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import numpy as np
 
@@ -102,6 +103,7 @@ class AzimuthAntennaPattern:
 # AUX_CAL parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=16)
 def parse_aux_cal(
     aux_cal_safe: str,
     swath: str,
@@ -162,6 +164,7 @@ def parse_aux_cal(
 # POEORB / RESORB parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=16)
 def parse_poeorb(eof_path: str) -> list[tuple[datetime, list, list]]:
     """
     Parse a Sentinel-1 POEORB or RESORB .EOF file.

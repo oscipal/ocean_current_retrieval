@@ -2,6 +2,7 @@
 
 import os
 import glob
+from functools import lru_cache
 import numpy as np
 import rasterio
 import xml.etree.ElementTree as ET
@@ -140,6 +141,7 @@ class S1Annotation:
 # Annotation parser
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=16)
 def parse_annotation(xml_path: str) -> S1Annotation:
     """Parse a Sentinel-1 IW SLC annotation XML into an S1Annotation object."""
     root = ET.parse(xml_path).getroot()
@@ -454,7 +456,43 @@ def slant_range_time_vector(annot: S1Annotation) -> np.ndarray:
     return annot.slant_range_time_start + np.arange(annot.n_samples) * dt_r
 
 
-def _nearest_estimate(estimates, burst_time: datetime):
-    """Return the estimate whose azimuth_time is closest to burst_time."""
+def _nearest_estimate(estimates, burst_time: datetime, warn_threshold_s: float | None = None):
+    """
+    Return the estimate whose azimuth_time is closest to burst_time.
+
+    Emits a warning only when the nearest record is genuinely a *different*
+    burst's record — i.e. further away than half the typical spacing between
+    consecutive records.  Anything closer than that is the correct in-burst
+    record: the IPF labels a ``dcEstimate``'s ``azimuthTime`` ~1 s after the
+    burst centre, so a fixed sub-second threshold gives false positives on
+    every burst.  A genuine fallback to a neighbour would be a full
+    record-interval (~2.7 s for IW) away and introduces a systematic geometry
+    Doppler error of roughly Δf_geom ≈ orbit_DC_rate × Δt.
+
+    Parameters
+    ----------
+    warn_threshold_s : float or None
+        Gap above which to warn.  When None (default), uses half the median
+        spacing between records, so the check self-tunes to the product.
+    """
+    import warnings
     diffs = [abs((e.azimuth_time - burst_time).total_seconds()) for e in estimates]
-    return estimates[int(np.argmin(diffs))]
+    best = int(np.argmin(diffs))
+
+    if warn_threshold_s is None:
+        if len(estimates) > 1:
+            times = sorted(e.azimuth_time.timestamp() for e in estimates)
+            warn_threshold_s = 0.5 * float(np.median(np.diff(times)))
+        else:
+            warn_threshold_s = 0.4
+
+    if diffs[best] > warn_threshold_s:
+        warnings.warn(
+            f"_nearest_estimate: nearest record is {diffs[best]:.3f} s away from "
+            f"burst time {burst_time.isoformat()} — the burst has no matching annotation "
+            f"record and is using a neighbour's polynomial. "
+            f"This will introduce a ~{diffs[best] * 15:.0f} Hz geometry Doppler error.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return estimates[best]

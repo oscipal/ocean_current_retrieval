@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 import xarray as xr
@@ -219,6 +220,7 @@ def _concat_component_datasets(component_datasets: list[xr.Dataset], source_name
     return merged
 
 
+@lru_cache(maxsize=16)
 def load_ocn_safe(
     safe_dir: str,
     swath: str | None = None,

@@ -35,6 +35,7 @@ def compute_rvl_burst(
     block_rg: int = 512,
     stride_az: int = 128,
     stride_rg: int = 256,
+    deramp_method: str = 'current',
     aux_cal_path: str | None = None,
     poeorb_path: str | None = None,
 ) -> xr.Dataset:
@@ -51,6 +52,8 @@ def compute_rvl_burst(
     block_rg      : int   Estimation block width in range samples.
     stride_az     : int   Block stride in azimuth.
     stride_rg     : int   Block stride in range.
+    deramp_method : str
+        SAFE-based deramp method used in Step I.
     aux_cal_path  : str or None
         Path to the AUX_CAL .SAFE directory.  When provided applies the
         varpi_delta correction, sideband bias, and attitude mispointing
@@ -102,7 +105,7 @@ def compute_rvl_burst(
     # Step I — deramp (eq. 1–3)
     # ------------------------------------------------------------------
     raw      = read_slc_burst(files['measurement'], annot, burst_idx)
-    deramped = deramp_burst(raw, annot, burst_idx)
+    deramped = deramp_burst(raw, annot, burst_idx, deramp_method=deramp_method)
 
     # Zero samples outside the annotation's per-line valid range.
     valid_mask = apply_burst_valid_sample_mask(deramped, burst)
@@ -223,6 +226,7 @@ def compute_rvl_burst(
             'stride_az':           stride_az,
             'stride_rg':           stride_rg,
             'algorithm_ref':       'Engen & Johnsen, DI-MPC-RVL-0534, steps I/II/III/V',
+            'deramp_method':       deramp_method,
             'poeorb_applied':      poeorb_path is not None,
             'aux_cal_applied':     aux_cal_path is not None,
             'mispointing_source':  mispointing_source,
@@ -280,6 +284,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--block-rg',  type=int, default=512, metavar='N')
     p.add_argument('--stride-az', type=int, default=128, metavar='N')
     p.add_argument('--stride-rg', type=int, default=256, metavar='N')
+    p.add_argument('--deramp-method', choices=('current', 'esa_eq1'), default='current',
+                   help='SAFE-based deramp method for Step I')
     p.add_argument('--aux-cal',   default=None, metavar='SAFE',
                    help='AUX_CAL .SAFE directory (enables varpi_delta / sideband / mispointing)')
     p.add_argument('--poeorb',    default=None, metavar='EOF',
@@ -304,6 +310,7 @@ if __name__ == '__main__':
         block_rg     = args.block_rg,
         stride_az    = args.stride_az,
         stride_rg    = args.stride_rg,
+        deramp_method = args.deramp_method,
         aux_cal_path = args.aux_cal,
         poeorb_path  = args.poeorb,
     )
