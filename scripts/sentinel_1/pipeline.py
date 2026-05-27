@@ -16,6 +16,7 @@ from scripts.diagnostics.pipeline_diagnostics import (
 from .metocean import (
     compute_stokes_radial,
     compute_wave_doppler_bias,
+    compute_wave_doppler_bias_cdop,
     compute_wave_doppler_bias_ocn,
     load_era5_wave,
     load_era5_wind,
@@ -1000,8 +1001,14 @@ def run_gamma_dop2d_pipeline(
         print('Loading ERA5 wind …')
         wind   = load_era5_wind(era5_wind, acq_time)
         v_wave = compute_wave_doppler_bias(wind, lat, lon, inc, look_az)
+    elif wave_source == 'cdop':
+        print('Loading ERA5 wind for CDOP …')
+        wind   = load_era5_wind(era5_wind, acq_time)
+        v_wave = compute_wave_doppler_bias_cdop(
+            wind, lat, lon, inc, look_az, annot.wavelength, polarisation,
+        )
     else:
-        raise ValueError(f"wave_source must be 'mouche' or 'ocn'; got {wave_source!r}")
+        raise ValueError(f"wave_source must be 'mouche', 'cdop', or 'ocn'; got {wave_source!r}")
     print(f'  wave_source={wave_source!r}  v_wave median: '
           f'{float(np.nanmedian(v_wave)):+.4f} m/s')
 
@@ -1102,6 +1109,9 @@ def run_gamma_pipeline_from_safe(
     descallop_blocks: bool = False,
     use_ocn_dc:     bool = False,
     mosaic_mode:    str = 'last',
+    f_dc_method:    str = 'lag1_gamma',
+    fft_block_az:   int = 64,
+    fft_block_rg:   int = 168,
     gamma_dir:      str | None = None,
     base_id:        str | None = None,
     keep_products:  bool = False,
@@ -1134,6 +1144,7 @@ def run_gamma_pipeline_from_safe(
     Returns the same dict schema as :func:`run_gamma_dop2d_pipeline`.
     """
     from .gamma_variants import (
+        fft_centroid_doppler,
         gamma_doppler_mosaic_first,
         gamma_doppler_mosaic_last,
         gamma_prep_scene,
@@ -1141,19 +1152,33 @@ def run_gamma_pipeline_from_safe(
 
     if mosaic_mode not in ('last', 'first'):
         raise ValueError(f"mosaic_mode must be 'last' or 'first'; got {mosaic_mode!r}")
+    if f_dc_method not in ('lag1_gamma', 'fft_centroid'):
+        raise ValueError(
+            f"f_dc_method must be 'lag1_gamma' or 'fft_centroid'; got {f_dc_method!r}"
+        )
 
     # Per-mode sensible geometry-Doppler source.  GAMMA's fd_model is the
     # burst-par polynomial for mosaic_last (correct subtraction) and all-zeros
-    # for mosaic_first (so 'gamma' would leave geometry in).  Allow override.
+    # for mosaic_first (so 'gamma' would leave geometry in).  fft_centroid
+    # produces no fitted polynomial either, so default to 'poeorb' there too.
+    # Allow override.
     if geom_source is None:
-        geom_source = 'gamma' if mosaic_mode == 'last' else 'poeorb'
+        if f_dc_method == 'fft_centroid':
+            geom_source = 'poeorb'
+        elif mosaic_mode == 'last':
+            geom_source = 'gamma'
+        else:
+            geom_source = 'poeorb'
 
     files = find_safe_files(slc_safe, subswath, polarisation)
     annotation_xml = files['annotation']
 
+    # fft_centroid always operates on the per-burst-deramped SLC, so its prep
+    # requirement is the same as mosaic_mode='last'.
+    needs_mosaic_slc = (mosaic_mode == 'first' and f_dc_method == 'lag1_gamma')
     cache_marker = (
-        f"{base_id}.deramp.slc" if mosaic_mode == 'last'
-        else f"{base_id}.deramp.mosaic.slc"
+        f"{base_id}.deramp.mosaic.slc" if needs_mosaic_slc
+        else f"{base_id}.deramp.slc"
     ) if base_id is not None else None
     existing = (
         gamma_dir is not None and cache_marker is not None
@@ -1161,7 +1186,13 @@ def run_gamma_pipeline_from_safe(
     )
 
     def _doppler_and_corrections(gd: str, bid: str) -> dict:
-        if mosaic_mode == 'last':
+        if f_dc_method == 'fft_centroid':
+            dop2d = fft_centroid_doppler(
+                gamma_dir=gd, base_id=bid,
+                block_az=fft_block_az, block_rg=fft_block_rg,
+                return_dict=True,
+            )
+        elif mosaic_mode == 'last':
             dop2d = gamma_doppler_mosaic_last(
                 blsz=blsz, gamma_dir=gd, base_id=bid,
                 add_demod_back=add_demod_back, return_dict=True,
@@ -1188,7 +1219,7 @@ def run_gamma_pipeline_from_safe(
     with gamma_prep_scene(
         slc_safe=slc_safe, subswath=subswath, poeorb_path=poeorb_path,
         polarisation=polarisation, out_dir=prep_out, base_id=base_id,
-        build_mosaic=(mosaic_mode == 'first'),
+        build_mosaic=needs_mosaic_slc,
     ) as prep:
         return _doppler_and_corrections(prep["gamma_dir"], prep["base_id"])
 

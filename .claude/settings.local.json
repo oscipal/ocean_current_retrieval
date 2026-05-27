@@ -114,7 +114,12 @@
       "Bash(awk 'NR>=1354 && NR<=1438' scripts/sentinel_1/pipeline.py)",
       "Bash(mv notebooks/__TRACKED_VAR__ _trash/notebooks/__TRACKED_VAR__)",
       "Bash(xargs -I {} basename {})",
-      "Bash(/home/oscipal/miniconda3/envs/ocean/bin/python *)"
+      "Bash(/home/oscipal/miniconda3/envs/ocean/bin/python *)",
+      "Bash(pip search *)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh api *)",
+      "Bash(gh search *)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

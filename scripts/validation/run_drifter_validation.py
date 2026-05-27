@@ -35,6 +35,7 @@ from scripts.sentinel_1.pipeline import (
     run_gamma_dop2d_pipeline,
     run_gamma_pipeline_from_safe,
 )
+from scripts.sentinel_1.metocean import load_ocn_rvl
 from scripts.sentinel_1.safe_io import find_safe_files, parse_annotation
 from scripts.sentinel_1.gamma_variants import gamma_doppler_mosaic_last
 from scripts.sentinel_1.grid_merge import smooth_block_grid
@@ -226,12 +227,12 @@ def validate_scene(
     max_dt_min: float = 30.0,
     scene_label: str | None = None,
     drifter_dataset: str = DRIFTER_DATASET_MY,
-    engine: str = "ours",
+    engine: str = "gamma",
     gamma_blsz: int = 256,
     gamma_add_demod_back: "str | bool" = "blend",
     gamma_geom_source: str = "gamma",
     gamma_wave_source: str = "mouche",
-    gamma_descallop_blocks: bool = False,
+    gamma_descallop_blocks: bool = True,
     gamma_keep_products: bool = False,
     smooth_az: int = 1,
     smooth_rg: int = 1,
@@ -261,7 +262,9 @@ def validate_scene(
         raise ValueError(f"engine must be 'ours' or 'gamma'; got {engine!r}")
 
     cache: dict = {}
-    ocn_cache: dict = {}   # (subswath, burst_idx) -> burst dict from run_all_bursts(use_ocn_dc=True)
+    # Pure-OCN baseline: rvlRadVel field from the OCN L2 product, loaded
+    # once per (scene, subswath).  No pipeline re-run needed.
+    ocn_rvl_cache: dict = {}
     rows = []
     for _, fix in in_fp.iterrows():
         hit = find_burst_for_point(safe, fix["latitude"], fix["longitude"], pol)
@@ -330,35 +333,25 @@ def validate_scene(
         v_los_s1_ocn = float(r["v_current_ocn"][iy, ix])
         v_los_glo12  = float(r["v_model"][iy, ix])
 
-        # OCN-product current: our pipeline driven by OCN's observed Doppler
-        # (rvlDcObs), sampled on the matching burst's lat/lon grid.  Same
-        # quantity the poster's middle panel shows.
-        ocn_key = (subswath, burst_idx)
-        if ocn_key not in ocn_cache:
+        # Pure OCN baseline: ESA's own rvlRadVel field, sampled at the drifter
+        # location.  No pipeline re-run — just load the OCN SAFE once per
+        # (scene, subswath) and look up the nearest pixel.  Sign convention
+        # already matches v_current_ocn (verified r=+0.66 pixel-wise on scene1).
+        if subswath not in ocn_rvl_cache:
             try:
-                print(f"[{label}] OCN-product pipeline on {subswath} burst {burst_idx}")
-                ocn_bursts = run_all_bursts(
-                    slc_safe=str(safe), subswath=subswath,
-                    poeorb_path=str(poeorb), aux_cal_path=str(aux_cal),
-                    ocn_safe=str(ocn_safe), era5_wind=str(era5_wind),
-                    era5_wave=str(era5_wave), glo12=str(glo12),
-                    polarisation=pol, use_ocn_dc=True,
-                    burst_indices=[burst_idx],
-                )
-                ocn_cache[ocn_key] = ocn_bursts[0] if ocn_bursts else None
+                ocn_rvl_cache[subswath] = load_ocn_rvl(str(ocn_safe), subswath, pol)
             except Exception as e:
-                print(f"[{label}] OCN-product pipeline failed on {subswath} "
-                      f"burst {burst_idx}: {e}")
-                ocn_cache[ocn_key] = None
-        ocn_r = ocn_cache[ocn_key]
-        if ocn_r is None:
-            v_los_ocn_product = float("nan")
+                print(f"[{label}] OCN rvlRadVel load failed on {subswath}: {e}")
+                ocn_rvl_cache[subswath] = None
+        ocn_rvl = ocn_rvl_cache[subswath]
+        if ocn_rvl is None or not np.isfinite(ocn_rvl["rad_vel"]).any():
+            v_los_ocn_native = float("nan")
         else:
             iy_o, ix_o = nearest_pixel(
-                ocn_r["lat"], ocn_r["lon"],
+                ocn_rvl["lat"], ocn_rvl["lon"],
                 float(fix["latitude"]), float(fix["longitude"]),
             )
-            v_los_ocn_product = float(ocn_r["v_current_ocn"][iy_o, ix_o])
+            v_los_ocn_native = float(ocn_rvl["rad_vel"][iy_o, ix_o])
 
         rows.append({
             "scene":              label,
@@ -376,12 +369,12 @@ def validate_scene(
             "v_los_drift":        v_los_drift,
             "v_los_s1":           v_los_s1,
             "v_los_s1_ocn":       v_los_s1_ocn,
-            "v_los_ocn_product":  v_los_ocn_product,
+            "v_los_ocn_native":   v_los_ocn_native,
             "v_los_glo12":        v_los_glo12,
-            "residual_s1":          v_los_s1            - v_los_drift,
-            "residual_s1_ocn":      v_los_s1_ocn        - v_los_drift,
-            "residual_ocn_product": v_los_ocn_product   - v_los_drift,
-            "residual_glo12":       v_los_glo12         - v_los_drift,
+            "residual_s1":          v_los_s1          - v_los_drift,
+            "residual_s1_ocn":      v_los_s1_ocn      - v_los_drift,
+            "residual_ocn_native":  v_los_ocn_native  - v_los_drift,
+            "residual_glo12":       v_los_glo12       - v_los_drift,
         })
     return pd.DataFrame(rows)
 
@@ -391,24 +384,26 @@ def print_summary(out: pd.DataFrame) -> None:
         print("No usable matches.")
         return
     print()
-    has_ocn_product = "v_los_ocn_product" in out.columns
-    cols = [
-        "scene", "platform_id", "time", "dt_min", "subswath", "burst",
-        "dist_km", "v_los_drift", "v_los_s1", "v_los_s1_ocn",
-    ]
-    if has_ocn_product:
-        cols += ["v_los_ocn_product"]
-    cols += ["v_los_glo12", "residual_s1", "residual_s1_ocn"]
-    if has_ocn_product:
-        cols += ["residual_ocn_product"]
+    has_ocn_native = "v_los_ocn_native" in out.columns
+
+    # Headline comparison: custom pipeline (with OCN mispointing) vs pure OCN
+    # L2 product (rvlRadVel) vs GLO12 model.  Everything else stays in the
+    # CSV for downstream / debugging but is dropped from the printed summary.
+    cols = ["scene", "platform_id", "time", "dt_min", "subswath", "burst",
+            "dist_km", "v_los_drift", "v_los_s1_ocn"]
+    if has_ocn_native:
+        cols += ["v_los_ocn_native"]
+    cols += ["v_los_glo12", "residual_s1_ocn"]
+    if has_ocn_native:
+        cols += ["residual_ocn_native"]
     cols += ["residual_glo12"]
 
     table = out.loc[:, cols].copy()
     table["time"] = pd.to_datetime(table["time"]).dt.strftime("%Y-%m-%d %H:%M")
-    float_cols = ["dt_min", "dist_km", "v_los_drift", "v_los_s1", "v_los_s1_ocn",
-                  "v_los_glo12", "residual_s1", "residual_s1_ocn", "residual_glo12"]
-    if has_ocn_product:
-        float_cols += ["v_los_ocn_product", "residual_ocn_product"]
+    float_cols = ["dt_min", "dist_km", "v_los_drift", "v_los_s1_ocn",
+                  "v_los_glo12", "residual_s1_ocn", "residual_glo12"]
+    if has_ocn_native:
+        float_cols += ["v_los_ocn_native", "residual_ocn_native"]
     for col in float_cols:
         table[col] = table[col].map(lambda v: f"{v:.3f}")
     print("Match table:")
@@ -418,40 +413,48 @@ def print_summary(out: pd.DataFrame) -> None:
     agg = dict(
         matches=("platform_id", "size"),
         platforms=("platform_id", "nunique"),
-        bias_s1=("residual_s1", "mean"),
-        rmse_s1=("residual_s1", lambda s: float(np.sqrt((s**2).mean()))),
         bias_s1_ocn=("residual_s1_ocn", "mean"),
         rmse_s1_ocn=("residual_s1_ocn", lambda s: float(np.sqrt((s**2).mean()))),
         bias_glo12=("residual_glo12", "mean"),
         rmse_glo12=("residual_glo12", lambda s: float(np.sqrt((s**2).mean()))),
     )
-    if has_ocn_product:
-        agg["bias_ocn_product"] = ("residual_ocn_product", "mean")
-        agg["rmse_ocn_product"] = ("residual_ocn_product",
-                                   lambda s: float(np.sqrt((s**2).mean())))
+    if has_ocn_native:
+        agg["bias_ocn_native"] = ("residual_ocn_native", "mean")
+        agg["rmse_ocn_native"] = ("residual_ocn_native",
+                                  lambda s: float(np.sqrt((s**2).mean())))
     scene_summary = (
         out.groupby("scene", as_index=False)
         .agg(**agg)
         .sort_values("scene")
     )
-    fmt_cols = ["bias_s1", "rmse_s1", "bias_s1_ocn", "rmse_s1_ocn",
-                "bias_glo12", "rmse_glo12"]
-    if has_ocn_product:
-        fmt_cols += ["bias_ocn_product", "rmse_ocn_product"]
+    fmt_cols = ["bias_s1_ocn", "rmse_s1_ocn", "bias_glo12", "rmse_glo12"]
+    if has_ocn_native:
+        fmt_cols += ["bias_ocn_native", "rmse_ocn_native"]
     for col in fmt_cols:
         scene_summary[col] = scene_summary[col].map(lambda v: f"{v:.3f}")
     print("Scene summary:")
     print(scene_summary.to_string(index=False))
     print()
 
-    summary_cols = ["v_los_s1", "v_los_s1_ocn", "v_los_glo12"]
-    if has_ocn_product:
-        summary_cols.insert(2, "v_los_ocn_product")
+    # Headline: custom pipeline (with mispointing), pure OCN rvlRadVel, GLO12.
+    summary_cols = ["v_los_s1_ocn"]
+    if has_ocn_native:
+        summary_cols += ["v_los_ocn_native"]
+    summary_cols += ["v_los_glo12"]
     for col in summary_cols:
-        diff = out[col] - out["v_los_drift"]
-        diff = diff.dropna()
-        print(f"{col:18s} − drifter:  N={len(diff):3d}  bias={diff.mean(): .3f}  "
-              f"RMSE={np.sqrt((diff**2).mean()): .3f}  m/s")
+        ok = out[["v_los_drift", col]].dropna()
+        if len(ok) < 2:
+            print(f"{col:18s} − drifter:  N={len(ok):3d}  (insufficient data)")
+            continue
+        x = ok["v_los_drift"].to_numpy(dtype=float)
+        y = ok[col].to_numpy(dtype=float)
+        diff = y - x
+        if x.std() > 0 and y.std() > 0:
+            r = float(np.corrcoef(x, y)[0, 1])
+        else:
+            r = float("nan")
+        print(f"{col:18s} − drifter:  N={len(ok):3d}  bias={diff.mean(): .3f}  "
+              f"RMSE={np.sqrt((diff**2).mean()): .3f}  r={r:+.3f}  m/s")
 
 
 def main() -> None:
@@ -475,11 +478,11 @@ def main() -> None:
                    help=f"CMEMS dataset id (default: {DRIFTER_DATASET_AUTO}). "
                         f"Auto tries {DRIFTER_DATASET_NRT} then {DRIFTER_DATASET_MY} for recent scenes, "
                         f"and the reverse order for older scenes.")
-    p.add_argument("--engine", default="ours", choices=("ours", "gamma"),
-                   help="Pipeline producing the SAR current: 'ours' (per-burst "
-                        "run_pipeline; default) or 'gamma' (GAMMA mosaic-last "
-                        "+ doppler_2d_SLC; runs GAMMA prep in-memory from the "
-                        "SAFE if cached products are absent).")
+    p.add_argument("--engine", default="gamma", choices=("ours", "gamma"),
+                   help="Pipeline producing the SAR current: 'gamma' (default; "
+                        "GAMMA mosaic-last + doppler_2d_SLC; runs GAMMA prep "
+                        "in-memory from the SAFE if cached products are absent) "
+                        "or 'ours' (per-burst run_pipeline).")
     p.add_argument("--gamma-blsz", type=int, default=256,
                    help="GAMMA doppler_2d_SLC azimuth block size (engine=gamma).")
     p.add_argument("--gamma-demod-back", default="blend",
@@ -490,13 +493,20 @@ def main() -> None:
                    choices=("gamma", "annotation", "poeorb"),
                    help="Geometry-Doppler source for engine=gamma (default 'gamma').")
     p.add_argument("--gamma-wave-source", default="mouche",
-                   choices=("mouche", "ocn"),
+                   choices=("mouche", "cdop", "ocn"),
                    help="Wave-Doppler bias source: 'mouche' (default; ERA5 wind + "
-                        "Mouche-2012 simplification) or 'ocn' (OCN owiRadVel — "
-                        "the operationally calibrated wind-wave Doppler velocity).")
-    p.add_argument("--gamma-descallop", action="store_true",
-                   help="Apply our azimuth-periodic descalloping (rvl.descallop) "
-                        "to the GAMMA mosaic-last f_dca grid before deriving v_r.")
+                        "simplified single-cosine scaling), 'cdop' (ERA5 wind + the "
+                        "full CDOP / Mouche-2012 neural-network GMF — includes "
+                        "upwind/downwind asymmetry and the non-cosine wave-growth "
+                        "term), or 'ocn' (OCN owiRadVel — the operationally "
+                        "calibrated wind-wave Doppler velocity).")
+    p.add_argument("--gamma-descallop", dest="gamma_descallop",
+                   action="store_true", default=True,
+                   help="Apply azimuth-periodic descalloping (default on). "
+                        "Pass --no-gamma-descallop to disable.")
+    p.add_argument("--no-gamma-descallop", dest="gamma_descallop",
+                   action="store_false",
+                   help="Disable descalloping of the GAMMA mosaic-last f_dca grid.")
     p.add_argument("--gamma-keep-products", action="store_true",
                    help="Persist GAMMA prep outputs (.slc/.par/.tops_par) after "
                         "the run instead of using a tempdir.  Speeds up re-runs.")

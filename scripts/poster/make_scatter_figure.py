@@ -31,9 +31,14 @@ import pandas as pd
 
 
 SERIES = [
-    {"col": "v_los_s1",          "label": "Custom pipeline", "color": "tab:blue"},
-    {"col": "v_los_ocn_product", "label": "Sentinel-1 OCN",  "color": "tab:orange"},
-    {"col": "v_los_glo12",       "label": "GLO12 model",     "color": "tab:green"},
+    # Custom pipeline (with OCN antenna-mispointing): GAMMA mosaic-last +
+    # simplified Mouche + descalloping + mispointing.  v_los_s1_ocn column
+    # (= 05_full_mouche_last in the method sweep).
+    {"col": "v_los_s1_ocn",     "label": "Custom pipeline", "color": "tab:blue"},
+    # Pure OCN L2 product — ESA's rvlRadVel field sampled at drifter location.
+    # No re-derivation by our pipeline; this is the operational ESA current.
+    {"col": "v_los_ocn_native", "label": "Sentinel-1 OCN",  "color": "tab:orange"},
+    {"col": "v_los_glo12",      "label": "GLO12 model",     "color": "tab:green"},
 ]
 
 

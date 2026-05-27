@@ -97,11 +97,11 @@ def main() -> None:
     p.add_argument("--drifter-dataset", default=DRIFTER_DATASET_AUTO,
                    help=f"CMEMS dataset id (default: {DRIFTER_DATASET_AUTO}). "
                         f"Auto tries {DRIFTER_DATASET_NRT} and {DRIFTER_DATASET_MY} in a scene-dependent order.")
-    p.add_argument("--engine", default="ours", choices=("ours", "gamma"),
-                   help="Pipeline producing the SAR current: 'ours' (per-burst "
-                        "run_pipeline; default) or 'gamma' (GAMMA mosaic-last + "
-                        "doppler_2d_SLC; runs GAMMA prep in-memory from the "
-                        "SAFE when cached products are absent).")
+    p.add_argument("--engine", default="gamma", choices=("ours", "gamma"),
+                   help="Pipeline producing the SAR current: 'gamma' (default; "
+                        "GAMMA mosaic-last + doppler_2d_SLC; runs GAMMA prep in-memory "
+                        "from the SAFE when cached products are absent) or 'ours' "
+                        "(per-burst run_pipeline).")
     p.add_argument("--gamma-blsz", type=int, default=256,
                    help="GAMMA doppler_2d_SLC azimuth block size (engine=gamma).")
     p.add_argument("--gamma-demod-back", default="blend",
@@ -111,11 +111,17 @@ def main() -> None:
                    choices=("gamma", "annotation", "poeorb"),
                    help="Geometry-Doppler source for engine=gamma (default 'gamma').")
     p.add_argument("--gamma-wave-source", default="mouche",
-                   choices=("mouche", "ocn"),
-                   help="Wave-Doppler bias source: 'mouche' (default) or 'ocn' "
+                   choices=("mouche", "cdop", "ocn"),
+                   help="Wave-Doppler bias source: 'mouche' (default, simplified) "
+                        "or 'cdop' (full Mouche-2012 NN GMF) or 'ocn' "
                         "(OCN owiRadVel — operationally calibrated).")
-    p.add_argument("--gamma-descallop", action="store_true",
-                   help="Apply azimuth-periodic descalloping to the GAMMA f_dca grid.")
+    p.add_argument("--gamma-descallop", dest="gamma_descallop",
+                   action="store_true", default=True,
+                   help="Apply azimuth-periodic descalloping (default on). "
+                        "Pass --no-gamma-descallop to disable.")
+    p.add_argument("--no-gamma-descallop", dest="gamma_descallop",
+                   action="store_false",
+                   help="Disable descalloping of the GAMMA f_dca grid.")
     p.add_argument("--gamma-keep-products", action="store_true",
                    help="Persist GAMMA prep outputs after the run instead of "
                         "using a tempdir.  Speeds up re-runs.")

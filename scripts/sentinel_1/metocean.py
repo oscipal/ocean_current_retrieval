@@ -155,6 +155,63 @@ def compute_wave_doppler_bias_ocn(
     ).astype(np.float32)
 
 
+def compute_wave_doppler_bias_cdop(
+    wind: dict,
+    our_lat: np.ndarray,
+    our_lon: np.ndarray,
+    our_inc: np.ndarray,
+    look_az_rad: float,
+    wavelength_m: float,
+    polarisation: str = "vv",
+) -> np.ndarray:
+    """Full CDOP (Mouche et al. 2012) C-band wave Doppler bias on LOS.
+
+    Replaces the single-cosine :func:`compute_wave_doppler_bias` with the
+    published 3-layer neural-network GMF.  Captures upwind/downwind
+    asymmetry and the non-cosine wave-growth term that the simplified form
+    misses.  Result is in m/s LOS, sign convention identical to the
+    simplified Mouche path.
+
+    Parameters
+    ----------
+    wind : dict
+        ERA5 wind dict from :func:`load_era5_wind` (lat, lon, u10, v10).
+    our_lat, our_lon, our_inc : ndarray
+        SAR retrieval grid (deg, deg, deg).
+    look_az_rad : float
+        Antenna look azimuth (rad, geographic-east origin counter-clockwise),
+        same as elsewhere in the pipeline.
+    wavelength_m : float
+        Radar wavelength (Sentinel-1 C-band ≈ 0.0555 m).
+    polarisation : str
+        'vv' or 'hh'.
+    """
+    from .cdop import cdop
+
+    u10 = _interp2d(wind["lat"], wind["lon"], wind["u10"], our_lat, our_lon)
+    v10 = _interp2d(wind["lat"], wind["lon"], wind["v10"], our_lat, our_lon)
+    u10 = np.asarray(u10, dtype=np.float64)
+    v10 = np.asarray(v10, dtype=np.float64)
+    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+
+    # phi: wind direction relative to SAR look direction, in degrees.  The
+    # simplified Mouche convention used here is the "to-direction" wind
+    # vector argument; CDOP folds phi into [0, 180] internally so the sign
+    # of phi is irrelevant.
+    wind_dir_to_rad = np.arctan2(u10, v10)
+    delta_phi_deg = np.rad2deg(wind_dir_to_rad - look_az_rad)
+
+    inc_deg = np.asarray(our_inc, dtype=np.float64)
+
+    pol = polarisation.upper()
+    if pol not in ("VV", "HH"):
+        raise ValueError(f"CDOP only defined for VV / HH; got {polarisation!r}")
+
+    f_dop = cdop(wind_speed, delta_phi_deg, inc_deg, pol)   # Hz
+    v_wave = (wavelength_m / 2.0) * np.asarray(f_dop, dtype=np.float64)
+    return v_wave.astype(np.float32)
+
+
 def load_ocn_rvl(ocn_safe: str, subswath: str, polarisation: str) -> dict:
     """Load OCN RVL fields for one subswath, fill -> NaN."""
     ocn = load_ocn_safe(ocn_safe, swath=subswath, polarisation=polarisation)

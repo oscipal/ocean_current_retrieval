@@ -672,3 +672,138 @@ def gamma_doppler_mosaic_last(
     )
     print(f"  saved -> {npz}")
     return npz
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Variant 3 — FFT spectral-centroid Doppler estimator (pure Python, no GAMMA)
+#
+# Drop-in alternative to ``doppler_2d_SLC``.  Operates on the per-burst-deramped
+# SLC and estimates the Doppler centroid as the energy-weighted spectral mean,
+# not the lag-1 autocorrelation phase.  Designed to match OCN's per-cell
+# variability — lag-1 averages ~10 000 complex pairs per cell and produces a
+# very smooth field; OCN's ``rvlDcObs`` has ~3× larger std at the same grid,
+# consistent with an FFT-based estimator.  Default grid (64×168 pixels per
+# cell) yields the OCN native 233×128 grid for an IW subswath.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fft_centroid_doppler(
+    gamma_dir: str,
+    base_id: str,
+    block_az: int = 64,
+    block_rg: int = 168,
+    out_dir: "str | None" = None,
+    overwrite: bool = False,
+    return_dict: bool = False,
+) -> "str | dict":
+    """FFT spectral-centroid Doppler centroid on the per-burst-deramped SLC.
+
+    For each (block_az × block_rg) cell, sums complex samples across range
+    bins, takes the azimuth FFT, and reports the energy-weighted mean
+    frequency as the per-cell Doppler centroid.  Returns the same dict
+    schema as :func:`gamma_doppler_mosaic_last` so the result can be fed
+    directly into :func:`pipeline.run_gamma_dop2d_pipeline`.
+
+    Because no GAMMA polynomial is fitted, ``fd_model`` is zero and
+    ``fd_diff == fd_measured``.  Use ``geom_source='poeorb'`` or
+    ``'annotation'`` (not ``'gamma'``) when running through
+    :func:`run_gamma_dop2d_pipeline` so the geometry-Doppler subtraction
+    actually happens.
+
+    Parameters
+    ----------
+    gamma_dir, base_id : str
+        Directory + basename for the deramped products
+        (``{gamma_dir}/{base_id}.deramp.slc`` and ``.par``).
+    block_az, block_rg : int
+        Cell size in lines × samples.  Default (64, 168) reproduces the
+        233×128 grid of OCN's RVL/OWI products for an IW subswath.
+    out_dir : str or None
+        Where to write the ``.npz``.  Defaults to ``gamma_dir``.
+    overwrite : bool
+        Re-run even when a cached ``.npz`` exists.
+    return_dict : bool
+        If True, skip the ``.npz`` save and return the result dict in memory.
+    """
+    slc_path = os.path.join(gamma_dir, f"{base_id}.deramp.slc")
+    par_path = slc_path + ".par"
+    if not os.path.exists(slc_path):
+        raise FileNotFoundError(
+            f"Deramped SLC not found: {slc_path}\n"
+            f"  Run gamma_prep_scene first."
+        )
+
+    n_rg = int(_read_par(par_path, "range_samples"))
+    n_az = int(_read_par(par_path, "azimuth_lines"))
+    r0   = float(_read_par(par_path, "near_range_slc"))
+    dr   = float(_read_par(par_path, "range_pixel_spacing"))
+    ati  = float(_read_par(par_path, "azimuth_line_time"))
+
+    if block_az < 8 or block_rg < 4:
+        raise ValueError(f"block_az/block_rg too small: {block_az}, {block_rg}")
+    n_caz = n_az // block_az
+    n_crg = n_rg // block_rg
+    if n_caz == 0 or n_crg == 0:
+        raise ValueError(
+            f"block_az={block_az} or block_rg={block_rg} larger than SLC "
+            f"dimensions ({n_az}x{n_rg})"
+        )
+
+    print(f"  fft_centroid_doppler: cell={block_az}x{block_rg} -> grid {n_caz}x{n_crg}  "
+          f"(PRF={1.0/ati:.1f} Hz)")
+
+    mm = np.memmap(slc_path, dtype='>f4', mode='r', shape=(n_az, 2 * n_rg))
+    re = np.array(mm[:n_caz * block_az, 0::2][:, :n_crg * block_rg], dtype=np.float32)
+    im = np.array(mm[:n_caz * block_az, 1::2][:, :n_crg * block_rg], dtype=np.float32)
+    s = (re + 1j * im).astype(np.complex64)
+    s4 = s.reshape(n_caz, block_az, n_crg, block_rg)
+    # Sum across range bins in cell to consolidate signal, then azimuth FFT.
+    s_col = s4.sum(axis=3)                          # (n_caz, block_az, n_crg)
+
+    freqs = np.fft.fftshift(np.fft.fftfreq(block_az, d=ati))
+    SP = np.fft.fftshift(np.abs(np.fft.fft(s_col, axis=1)) ** 2, axes=1)
+    denom = SP.sum(axis=1)
+    num = (SP * freqs[None, :, None]).sum(axis=1)
+    safe_denom = np.where(denom > 0, denom, 1.0)
+    fd_meas = np.where(denom > 0, num / safe_denom, 0.0).astype(np.float32)
+    # Mask near-empty cells (burst overlap voids).
+    energy = SP.max(axis=1)
+    valid = energy > 1e-6 * energy.max()
+    fd_meas[~valid] = 0.0
+
+    fd_model = np.zeros_like(fd_meas)
+    fd_diff  = fd_meas.copy()
+
+    rg_centers_idx = (np.arange(n_crg) + 0.5) * block_rg
+    range_m = (r0 + rg_centers_idx * dr).astype(np.float64)
+    az_time = ((np.arange(n_caz) + 0.5) * block_az * ati).astype(np.float64)
+
+    result = {
+        "fd_measured": fd_meas,
+        "fd_model":    fd_model,
+        "fd_diff":     fd_diff,
+        "range_m":     range_m,
+        "az_time_s":   az_time,
+        "blsz_lines":  int(block_az),
+        "mosaic_mode": "fft_centroid",
+    }
+
+    if return_dict:
+        return result
+
+    out_dir = out_dir or gamma_dir
+    npz = os.path.join(out_dir, f"{base_id}.dop2d.fft_centroid.{block_az}x{block_rg}.npz")
+    if os.path.exists(npz) and not overwrite:
+        print(f"  [cached] {npz}")
+        return npz
+    np.savez(
+        npz,
+        fd_measured=result["fd_measured"],
+        fd_model=result["fd_model"],
+        fd_diff=result["fd_diff"],
+        range_m=result["range_m"],
+        az_time_s=result["az_time_s"],
+        blsz_lines=np.array(block_az),
+        mosaic_mode=np.array("fft_centroid"),
+    )
+    print(f"  saved -> {npz}")
+    return npz
