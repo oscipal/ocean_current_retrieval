@@ -136,7 +136,31 @@
       "Bash(sed -n '10,22p' results.tex)",
       "Bash(awk '/subsection\\\\{Comparison of the combination strategies\\\\}/,/subsection\\\\{Drifter validation/' results.tex)",
       "Bash(awk '/paragraph\\\\{Summary\\\\}/,/^$/{print} /paragraph\\\\{Summary\\\\}/{f=1}' results.tex)",
-      "Bash(awk '/\\\\\\\\begin\\\\{align\\\\}/{f=1} f{print NR\": \"$0} /\\\\\\\\end\\\\{align\\\\}/{f=0}' methods.tex)"
+      "Bash(awk '/\\\\\\\\begin\\\\{align\\\\}/{f=1} f{print NR\": \"$0} /\\\\\\\\end\\\\{align\\\\}/{f=0}' methods.tex)",
+      "Bash(awk '/subsection\\\\{Doppler centroid estimation/,/subsection\\\\{Second Doppler/' methods.tex)",
+      "Bash(sed -i 's/, engenjohnsen}/}/g' methods.tex)",
+      "Bash(sed -i 's/esther2024/yang2024/g' introduction.tex)",
+      "Bash(sed -i 's/reduce this bias \\\\\\\\citep{recon2025}/reduce this bias \\\\\\\\citep{moiseev2022}/' introduction.tex)",
+      "Bash(sed -i 's/\\\\\\\\citep{validation2025, recon2025}/\\\\\\\\citep{validation2025}/' introduction.tex)",
+      "Bash(tee /tmp/used.txt)",
+      "Bash(tee /tmp/defined.txt)",
+      "Bash(set -e)",
+      "Bash(mv notebooks/*.ipynb _archive/notebooks_old/)",
+      "Bash(:)",
+      "Bash(mv scripts/poster/make_*.py scripts/figures/)",
+      "Bash(sed -i 's#REPO_ROOT / \"scripts\" / \"download_era5.py\"#REPO_ROOT / \"scripts\" / \"download\" / \"download_era5.py\"#' scripts/download/download_matched_scenes.py)",
+      "Bash(awk '{print $2}')",
+      "Bash(cat)",
+      "Bash(rm -f requirements_pip.txt)",
+      "Bash(sed -i 's#scripts/poster/make_scatter_figure.py#scripts/figures/make_scatter_figure.py#g' feedback_viz_vs_numerics.md)",
+      "Bash(sed -i 's/There is \\\\*\\\\*no `references.bib`\\\\*\\\\* — the user manages the bibliography themselves \\(keys are cited in-text only; don.t invent a bib\\)./The `references.bib` is built \\(notes\\\\/files\\\\/references.bib\\); the user manages \\\\/ verifies entries. Keys: see the bib./' project_report.md)",
+      "Bash(rm -f project_pending_methods_wording.md)",
+      "Bash(sed -i '/PENDING methods wording fix/d' MEMORY.md)",
+      "Bash(mv run_pipeline.py scripts/run_pipeline.py)",
+      "Bash(sed -i 's#REPO_ROOT = Path\\(__file__\\).resolve\\(\\).parent$#REPO_ROOT = Path\\(__file__\\).resolve\\(\\).parents[1]#' scripts/run_pipeline.py)",
+      "Bash(sed -i 's#python run_pipeline.py#python scripts/run_pipeline.py#g' scripts/run_pipeline.py)",
+      "Bash(sed -i \"s#from run_pipeline import#from scripts.run_pipeline import#g; s#os.path.join\\(REPO, 'run_pipeline.py'\\)#os.path.join\\(REPO, 'scripts', 'sentinel_1'\\)#g\" notebooks/*.ipynb)",
+      "Bash(sed -i 's#python run_pipeline.py#python scripts/run_pipeline.py#g' README.md)"
     ]
   }
 }

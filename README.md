@@ -1,118 +1,112 @@
-# Ocean Current Retrieval from Sentinel-1 RVL
+# Ocean Current Retrieval from Sentinel-1 Doppler
 
-This repository processes Sentinel-1 IW SLC data to estimate ocean surface radial velocity from Doppler centroid anomalies. The active code path is centered on Sentinel-1. Older BIOMASS-related utilities are still present, but they are not the main pipeline.
+Retrieve the **sea surface radial current** from Sentinel-1 Interferometric
+Wide (IW) SLC data using the Doppler Centroid Anomaly (DCA) method. The
+Doppler centroid is estimated for each TOPS burst, the geometry and
+instrument biases are removed, the wind/wave (geophysical) Doppler is
+subtracted, and the result is gridded into a current map and validated
+against in-situ drifters.
 
-## Sentinel-1 Processing Model
+---
 
-The retrieval is built around the Sentinel-1 RVL chain:
-
-1. Read Sentinel-1 SAFE annotation and burst SLC data.
-2. Deramp the TOPS burst.
-3. Estimate azimuth correlation or Doppler per block.
-4. Convert Doppler to Doppler centroid anomaly by subtracting geometry and sideband terms.
-5. Convert the anomaly to radial velocity.
-6. Geolocate the result.
-7. Apply optional metocean corrections and comparisons:
-   ERA5 Stokes drift, ERA5 wave Doppler bias, OCN mispointing, and GLO12 current comparison.
-
-There are two main processing modes:
-
-- `scripts/sentinel_1/pipeline.py`: the main operational Sentinel-1 workflow, including merged-burst processing and corrected radial-current outputs.
-- `scripts/sentinel_1/burst_pipeline.py`: a single-burst diagnostic path used to inspect burst-level behavior without the merged workflow.
-
-## Main Scripts
-
-### Core Sentinel-1 package
-
-- [`scripts/sentinel_1/pipeline.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/pipeline.py:1)
-  Main Sentinel-1 RVL pipeline. This is the primary entry point for burst-wise and merged-burst retrievals, current corrections, and model comparison products.
-
-- [`scripts/sentinel_1/rvl.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/rvl.py:1)
-  Core RVL algorithms: deramping, burst merging, correlation estimation, Doppler conversion, geometry subtraction, descalloping, and geolocation.
-
-- [`scripts/sentinel_1/burst_pipeline.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/burst_pipeline.py:1)
-  Single-burst Sentinel-1 RVL workflow. Useful for debugging burst-specific failures before any burst merge or mosaic step.
-
-- [`scripts/sentinel_1/safe_io.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/safe_io.py:1)
-  Sentinel-1 SAFE discovery, annotation parsing, burst reading, and calibration/noise LUT access.
-
-- [`scripts/sentinel_1/aux_files.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/aux_files.py:1)
-  Sentinel-1 auxiliary product parsers for AUX_CAL, AUX_INS, and orbit files such as POEORB.
-
-- [`scripts/sentinel_1/ocn_product.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/ocn_product.py:1)
-  Reader for Sentinel-1 Level-2 OCN SAFE products.
-
-- [`scripts/sentinel_1/ocn_analysis.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/ocn_analysis.py:1)
-  Analysis utilities built on top of OCN RVL and OWI fields, including radial-current and mispointing-related helpers.
-
-- [`scripts/sentinel_1/metocean.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/metocean.py:1)
-  Loads and interpolates ERA5, OCN, and GLO12 fields onto the SAR grid and look direction.
-
-- [`scripts/sentinel_1/grid_merge.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/grid_merge.py:1)
-  Merges burst-level outputs onto regular grids for scene-scale comparisons.
-
-- [`scripts/sentinel_1/plots.py`](/home/oscipal/ocean_current_retrieval/scripts/sentinel_1/plots.py:1)
-  Plotting helpers for merged Sentinel-1 retrievals and model comparisons.
-
-### Diagnostics
-
-These scripts are for investigation and validation, not the core production path.
-
-- [`scripts/diagnostics/pipeline_diagnostics.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/pipeline_diagnostics.py:1)
-  Intermediate RVL diagnostics such as Doppler-centroid plots, pipeline-step plots, and mispointing checks.
-
-- [`scripts/diagnostics/current_comparison.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/current_comparison.py:1)
-  Burst-level comparison between the SLC-derived RVL result, OCN products, ERA5 corrections, and GLO12.
-
-- [`scripts/diagnostics/burst_fdc_offsets.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/burst_fdc_offsets.py:1)
-  Compares burst-wise `f_dc` behavior under different deramp and PRF conventions.
-
-- [`scripts/diagnostics/tops_scaling.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/tops_scaling.py:1)
-  Tests alternative TOPS scaling assumptions for Doppler retrieval.
-
-- [`scripts/diagnostics/era5_influence.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/era5_influence.py:1)
-  Visualizes the spatial influence of ERA5-based wind and wave corrections.
-
-- [`scripts/diagnostics/aux_cal_check.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/aux_cal_check.py:1)
-  Quick AUX_CAL sanity check for ambiguity ratio and sideband-bias terms.
-
-- [`scripts/diagnostics/attitude_inspection.py`](/home/oscipal/ocean_current_retrieval/scripts/diagnostics/attitude_inspection.py:1)
-  One-off diagnostic for Sentinel-1 attitude quaternion conventions used in mispointing analysis.
-
-### Shared / legacy utilities
-
-- [`scripts/download_era5.py`](/home/oscipal/ocean_current_retrieval/scripts/download_era5.py:1)
-  Downloads ERA5 wind and wave data from a JSON config file.
-
-- [`scripts/gamma_io.py`](/home/oscipal/ocean_current_retrieval/scripts/gamma_io.py:1)
-  Shared readers for GAMMA-format SLC products and related metadata. Still used by some legacy and BIOMASS-oriented code paths.
-
-## Configuration and Inputs
-
-- [`config/download_era5.json`](/home/oscipal/ocean_current_retrieval/config/download_era5.json:1)
-  Default configuration for ERA5 downloads.
-
-Typical Sentinel-1 processing requires:
-
-- Sentinel-1 IW SLC SAFE
-- POEORB orbit file
-- AUX_CAL file
-- optional OCN SAFE
-- optional ERA5 wind and wave NetCDF files
-- optional GLO12 ocean current NetCDF file
-
-## Data Sources
-
-- Sentinel-1 SLC and OCN products: ESA Copernicus
-- POEORB / AUX files: ESA Sentinel-1 auxiliary products
-- ERA5 wind and waves: Copernicus Climate Data Store
-- GLO12 ocean currents: Copernicus Marine Service
-
-## Setup
+## Quick start
 
 ```bash
-git clone git@github.com:oscipal/ocean_current_retrieval.git
-cd ocean_current_retrieval
-conda create --name ocr --file requirements.txt
-conda activate ocr
+conda create -n ocean python=3.12 && conda activate ocean
+pip install -r requirements.txt
+# GAMMA SAR processor must be installed separately and on PATH.
+
+# Run the pipeline on one scene (default = custom pipeline):
+python scripts/run_pipeline.py
+
+# Run the hybrid configuration instead:
+python scripts/run_pipeline.py --hybrid
 ```
+
+`scripts/run_pipeline.py` writes a NetCDF current map and a quicklook PNG to
+`data/current/`, and prints summary statistics.
+
+```
+python scripts/run_pipeline.py [--hybrid] [--scene scene1] [--subswath iw1]
+                       [--pol vv] [--data-root data] [--out-dir data/current]
+```
+
+---
+
+## The two pipelines
+
+| | Custom pipeline (default) | Hybrid (`--hybrid`) |
+|---|---|---|
+| Doppler | estimated per burst with GAMMA (lag-1) | observed Doppler from the Sentinel-1 OCN product |
+| Geometry | removed from the precise orbit | from the OCN product |
+| Corrections | sideband, descalloping, mispointing, Stokes, wave (Mouche) | sideband, mispointing, Stokes, wave (Mouche) |
+| Works on | radar range/azimuth grid, then gridded | OCN product grid |
+
+Both end in `v_current_ocn`, the radial surface current including the
+ocean-product mispointing term.
+
+---
+
+## Repository layout
+
+```
+scripts/run_pipeline.py    Entry point: default custom pipeline, --hybrid for the hybrid
+requirements.txt           Python dependencies (env "ocean")
+scripts/
+  sentinel_1/              Core library (pipeline, RVL, gamma_variants, grid_merge,
+                           metocean, cdop, ocn_product, safe_io, ...)
+  download/                Data download (ERA5, matched Sentinel-1 + drifter scenes)
+  diagnostics/             Doppler/deramp diagnostics (spectrogram, unwrapped grid, ...)
+  figures/                 Figure generation (report figures, comparison maps, scatter)
+  validation/              Drifter validation and method sweeps
+notebooks/
+  1_pipeline_walkthrough.ipynb    Custom pipeline, step by step
+  2_hybrid_pipeline.ipynb         Hybrid pipeline
+  3_evaluation_comparison.ipynb   Drifter validation + model comparison
+data/                      Sentinel-1 SAFE, ERA5, GLO12, drifters, outputs
+notes/                     LaTeX project report (notes/files/) and its figures
+config/                    Download configuration (e.g. download_era5.json)
+_archive/                  Old notebooks, BIOMASS utilities, scratch (not maintained)
+```
+
+The core library is imported as `scripts.sentinel_1.*` from the repo root,
+so run scripts and notebooks from the repository root.
+
+---
+
+## Notebooks
+
+- **`1_pipeline_walkthrough.ipynb`** — runs the custom pipeline and shows the
+  field after every step (Doppler domain in Hz, then velocity in m/s).
+- **`2_hybrid_pipeline.ipynb`** — runs the hybrid configuration and shows the
+  ocean-product Doppler and the resulting current.
+- **`3_evaluation_comparison.ipynb`** — validates against drifters and
+  compares the custom pipeline, the hybrid, the operational OCN product and
+  the GLO12 model; shows the scatter and the cumulative effect of each
+  correction. Uses the precomputed tables in `data/drifters/`.
+
+---
+
+## Validation and figures
+
+```bash
+# Drifter validation across scenes (writes data/drifters/validation_results.csv):
+python scripts/validation/run_drifter_validation_all.py --help
+
+# Regenerate the report figures into notes/files/figures/:
+python scripts/figures/make_report_figures.py
+
+# Four-way comparison map (custom | hybrid | OCN | GLO12):
+python scripts/figures/make_poster_figure.py --current
+```
+
+---
+
+## Data
+
+Sentinel-1 IW SLC + Level-2 OCN scenes go under `data/sentinel-1/<scene>/`
+(`S1A_IW_SLC.SAFE`, `S1A_IW_OCN.SAFE`, the `POEORB` orbit `.EOF`, and the
+`AUX_CAL` calibration). ERA5 wind/wave and the GLO12 current go under
+`data/era5_data/<scene>/`. Use the download scripts in `scripts/download/`
+to fetch ERA5 (`cdsapi`) and the matched CMEMS GLO12/drifter data
+(`copernicusmarine`).

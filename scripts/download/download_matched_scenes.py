@@ -288,7 +288,7 @@ def download_era5(scene_bbox: tuple[float, float, float, float], t0: datetime, o
     cfg_path = out_dir / "era5_config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2))
     subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / "download_era5.py"), "--config", str(cfg_path)],
+        [sys.executable, str(REPO_ROOT / "scripts" / "download" / "download_era5.py"), "--config", str(cfg_path)],
         check=True,
     )
 
