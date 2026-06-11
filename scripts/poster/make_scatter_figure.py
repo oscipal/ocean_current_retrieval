@@ -34,11 +34,14 @@ SERIES = [
     # Custom pipeline (with OCN antenna-mispointing): GAMMA mosaic-last +
     # simplified Mouche + descalloping + mispointing.  v_los_s1_ocn column
     # (= 05_full_mouche_last in the method sweep).
-    {"col": "v_los_s1_ocn",     "label": "Custom pipeline", "color": "tab:blue"},
+    {"col": "v_los_s1_ocn",      "label": "Custom pipeline",         "color": "tab:blue"},
+    # Hybrid baseline: our pipeline driven by OCN's rvlDcObs as f_dc (and
+    # our own geom / Stokes / Mouche / mispointing on top).  Sits between
+    # the pure-custom and pure-ESA results.
+    {"col": "v_los_ocn_product", "label": "OCN + custom corrections", "color": "tab:purple"},
     # Pure OCN L2 product — ESA's rvlRadVel field sampled at drifter location.
-    # No re-derivation by our pipeline; this is the operational ESA current.
-    {"col": "v_los_ocn_native", "label": "Sentinel-1 OCN",  "color": "tab:orange"},
-    {"col": "v_los_glo12",      "label": "GLO12 model",     "color": "tab:green"},
+    {"col": "v_los_ocn_native",  "label": "Sentinel-1 OCN",          "color": "tab:orange"},
+    {"col": "v_los_glo12",       "label": "GLO12 model",             "color": "tab:green"},
 ]
 
 
@@ -72,6 +75,9 @@ def main() -> None:
                    help="Scatter point alpha (default 0.65).")
     p.add_argument("--marker-size", type=float, default=28.0,
                    help="Scatter point size (default 28).")
+    p.add_argument("--no-hybrid", action="store_true",
+                   help="Drop the 'OCN + custom corrections' (v_los_ocn_product) "
+                        "series, leaving Custom pipeline | Sentinel-1 OCN | GLO12.")
     p.add_argument("--debias", action="store_true",
                    help="Subtract each series' median residual before plotting, "
                         "so points sit on the 1:1 line.  Legend reports the "
@@ -87,8 +93,11 @@ def main() -> None:
     df = pd.read_csv(args.csv)
     if "v_los_drift" not in df.columns:
         raise SystemExit("CSV missing required column 'v_los_drift'.")
-    available = [s for s in SERIES if s["col"] in df.columns]
-    missing = [s["col"] for s in SERIES if s["col"] not in df.columns]
+    series = SERIES
+    if args.no_hybrid:
+        series = [s for s in SERIES if s["col"] != "v_los_ocn_product"]
+    available = [s for s in series if s["col"] in df.columns]
+    missing = [s["col"] for s in series if s["col"] not in df.columns]
     if missing:
         print(f"warning: CSV missing columns {missing}; plotting only {[s['col'] for s in available]}")
     if not available:

@@ -119,7 +119,24 @@
       "WebFetch(domain:github.com)",
       "Bash(gh api *)",
       "Bash(gh search *)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(command -v rsvg-convert inkscape)",
+      "Bash(ls -la *.bib)",
+      "Bash(find . -name \"*.bib\")",
+      "Bash(echo \"exit:$?\")",
+      "Bash(command -v pdflatex biber latexmk)",
+      "Bash(sed -i 's/Doppler anomaly post geometry\\\\. Both/Doppler anomaly post geometry correction. Both/' methods.tex)",
+      "Bash(sed -i 's/Doppler anomaly post descalloping\\\\. On/Doppler anomaly post descalloping correction. On/' methods.tex)",
+      "Bash(sed -i 's/Doppler anomaly post mispointing\\\\. On/Doppler anomaly post mispointing correction. On/' methods.tex)",
+      "Bash(sed -n '150,166p' methods.tex)",
+      "Bash(sed -n '505,525p' methods.tex)",
+      "Bash(sed -n '22,72p' results.tex)",
+      "Bash(sed -n '86,101p' results.tex)",
+      "Bash(awk '/subsection\\\\{Combination and gridding\\\\}/,/subsection\\\\{Reference data/' methods.tex)",
+      "Bash(sed -n '10,22p' results.tex)",
+      "Bash(awk '/subsection\\\\{Comparison of the combination strategies\\\\}/,/subsection\\\\{Drifter validation/' results.tex)",
+      "Bash(awk '/paragraph\\\\{Summary\\\\}/,/^$/{print} /paragraph\\\\{Summary\\\\}/{f=1}' results.tex)",
+      "Bash(awk '/\\\\\\\\begin\\\\{align\\\\}/{f=1} f{print NR\": \"$0} /\\\\\\\\end\\\\{align\\\\}/{f=0}' methods.tex)"
     ]
   }
 }

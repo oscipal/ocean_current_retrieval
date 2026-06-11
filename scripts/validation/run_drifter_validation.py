@@ -265,6 +265,10 @@ def validate_scene(
     # Pure-OCN baseline: rvlRadVel field from the OCN L2 product, loaded
     # once per (scene, subswath).  No pipeline re-run needed.
     ocn_rvl_cache: dict = {}
+    # Hybrid baseline: our pipeline driven by OCN's rvlDcObs as f_dc, with
+    # our own geometry/Stokes/wave/mispointing corrections on top.  Cached
+    # per subswath (one run_all_bursts call covers all bursts of the swath).
+    ocn_hybrid_cache: dict = {}
     rows = []
     for _, fix in in_fp.iterrows():
         hit = find_burst_for_point(safe, fix["latitude"], fix["longitude"], pol)
@@ -353,6 +357,37 @@ def validate_scene(
             )
             v_los_ocn_native = float(ocn_rvl["rad_vel"][iy_o, ix_o])
 
+        # Combined/hybrid baseline: our pipeline driven by OCN's rvlDcObs.
+        # Cached per subswath (one call processes all bursts of the swath).
+        if subswath not in ocn_hybrid_cache:
+            try:
+                print(f"[{label}] hybrid pipeline (use_ocn_dc=True) on {subswath}")
+                ocn_hybrid_cache[subswath] = run_all_bursts(
+                    slc_safe=str(safe), subswath=subswath,
+                    poeorb_path=str(poeorb), aux_cal_path=str(aux_cal),
+                    ocn_safe=str(ocn_safe), era5_wind=str(era5_wind),
+                    era5_wave=str(era5_wave), glo12=str(glo12),
+                    polarisation=pol, use_ocn_dc=True,
+                )
+            except Exception as e:
+                print(f"[{label}] hybrid pipeline failed on {subswath}: {e}")
+                ocn_hybrid_cache[subswath] = None
+        hybrid_bursts = ocn_hybrid_cache[subswath]
+        hybrid_r = None
+        if hybrid_bursts is not None:
+            for b in hybrid_bursts:
+                if int(b.get("burst_idx", -1)) == int(burst_idx):
+                    hybrid_r = b
+                    break
+        if hybrid_r is None:
+            v_los_ocn_product = float("nan")
+        else:
+            iy_h, ix_h = nearest_pixel(
+                hybrid_r["lat"], hybrid_r["lon"],
+                float(fix["latitude"]), float(fix["longitude"]),
+            )
+            v_los_ocn_product = float(hybrid_r["v_current_ocn"][iy_h, ix_h])
+
         rows.append({
             "scene":              label,
             "platform_id":        int(fix["platform_id"]),
@@ -369,10 +404,12 @@ def validate_scene(
             "v_los_drift":        v_los_drift,
             "v_los_s1":           v_los_s1,
             "v_los_s1_ocn":       v_los_s1_ocn,
+            "v_los_ocn_product":  v_los_ocn_product,
             "v_los_ocn_native":   v_los_ocn_native,
             "v_los_glo12":        v_los_glo12,
             "residual_s1":          v_los_s1          - v_los_drift,
             "residual_s1_ocn":      v_los_s1_ocn      - v_los_drift,
+            "residual_ocn_product": v_los_ocn_product - v_los_drift,
             "residual_ocn_native":  v_los_ocn_native  - v_los_drift,
             "residual_glo12":       v_los_glo12       - v_los_drift,
         })
@@ -384,16 +421,20 @@ def print_summary(out: pd.DataFrame) -> None:
         print("No usable matches.")
         return
     print()
-    has_ocn_native = "v_los_ocn_native" in out.columns
+    has_ocn_native  = "v_los_ocn_native"  in out.columns
+    has_ocn_product = "v_los_ocn_product" in out.columns
 
-    # Headline comparison: custom pipeline (with OCN mispointing) vs pure OCN
-    # L2 product (rvlRadVel) vs GLO12 model.  Everything else stays in the
-    # CSV for downstream / debugging but is dropped from the printed summary.
+    # Headline: custom pipeline (mispt) | hybrid (OCN f_dc + our corrections) |
+    # pure OCN (rvlRadVel) | GLO12.
     cols = ["scene", "platform_id", "time", "dt_min", "subswath", "burst",
             "dist_km", "v_los_drift", "v_los_s1_ocn"]
+    if has_ocn_product:
+        cols += ["v_los_ocn_product"]
     if has_ocn_native:
         cols += ["v_los_ocn_native"]
     cols += ["v_los_glo12", "residual_s1_ocn"]
+    if has_ocn_product:
+        cols += ["residual_ocn_product"]
     if has_ocn_native:
         cols += ["residual_ocn_native"]
     cols += ["residual_glo12"]
@@ -402,6 +443,8 @@ def print_summary(out: pd.DataFrame) -> None:
     table["time"] = pd.to_datetime(table["time"]).dt.strftime("%Y-%m-%d %H:%M")
     float_cols = ["dt_min", "dist_km", "v_los_drift", "v_los_s1_ocn",
                   "v_los_glo12", "residual_s1_ocn", "residual_glo12"]
+    if has_ocn_product:
+        float_cols += ["v_los_ocn_product", "residual_ocn_product"]
     if has_ocn_native:
         float_cols += ["v_los_ocn_native", "residual_ocn_native"]
     for col in float_cols:
@@ -418,6 +461,10 @@ def print_summary(out: pd.DataFrame) -> None:
         bias_glo12=("residual_glo12", "mean"),
         rmse_glo12=("residual_glo12", lambda s: float(np.sqrt((s**2).mean()))),
     )
+    if has_ocn_product:
+        agg["bias_ocn_product"] = ("residual_ocn_product", "mean")
+        agg["rmse_ocn_product"] = ("residual_ocn_product",
+                                   lambda s: float(np.sqrt((s**2).mean())))
     if has_ocn_native:
         agg["bias_ocn_native"] = ("residual_ocn_native", "mean")
         agg["rmse_ocn_native"] = ("residual_ocn_native",
@@ -428,6 +475,8 @@ def print_summary(out: pd.DataFrame) -> None:
         .sort_values("scene")
     )
     fmt_cols = ["bias_s1_ocn", "rmse_s1_ocn", "bias_glo12", "rmse_glo12"]
+    if has_ocn_product:
+        fmt_cols += ["bias_ocn_product", "rmse_ocn_product"]
     if has_ocn_native:
         fmt_cols += ["bias_ocn_native", "rmse_ocn_native"]
     for col in fmt_cols:
@@ -436,8 +485,10 @@ def print_summary(out: pd.DataFrame) -> None:
     print(scene_summary.to_string(index=False))
     print()
 
-    # Headline: custom pipeline (with mispointing), pure OCN rvlRadVel, GLO12.
+    # Headline: custom (mispt) | hybrid OCN product | pure OCN rvlRadVel | GLO12.
     summary_cols = ["v_los_s1_ocn"]
+    if has_ocn_product:
+        summary_cols += ["v_los_ocn_product"]
     if has_ocn_native:
         summary_cols += ["v_los_ocn_native"]
     summary_cols += ["v_los_glo12"]
